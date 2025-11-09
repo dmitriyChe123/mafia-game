@@ -1,0 +1,53 @@
+# ========================
+# Node.js
+# ========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ========================
+# Build outputs
+# ========================
+client/build/
+server/dist/
+server/build/
+
+# ========================
+# Environment files
+# ========================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ========================
+# System / OS files
+# ========================
+.DS_Store
+Thumbs.db
+
+# ========================
+# Editors / IDE
+# ========================
+.vscode/
+.idea/
+
+# ========================
+# Logs
+# ========================
+logs
+*.log
+
+# ========================
+# TypeScript
+# ========================
+server/**/*.tsbuildinfo
+client/**/*.tsbuildinfo
+
+# ========================
+# Misc
+# ========================
+*.bak
+*.swp
