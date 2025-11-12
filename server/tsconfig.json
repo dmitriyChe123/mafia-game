@@ -10,7 +10,8 @@
     "module": "ESNext",
     "moduleResolution": "NodeNext",
     "verbatimModuleSyntax": false,
-    "target": "esnext",
+    "target": "ES2020",
+    "esModuleInterop": true,
     "types": [],
     // For nodejs:
     // "lib": ["esnext"],
@@ -42,5 +43,8 @@
     "noUncheckedSideEffectImports": true,
     "moduleDetection": "force",
     "skipLibCheck": true,
-  }
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "dist"
+  },
+  "include": ["src"]
 }
