@@ -1,13 +1,14 @@
 {
-  "name": "server",
+  "name": "mafia-backend",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "ts-node src/index.ts",
-    "start": "node dist/index.js",
-    "build": "tsc"
+    "dev": "vercel dev",
+    "start": "vercel dev",
+    "build": "echo 'Serverless functions, no build needed"
   },
   "keywords": [],
   "author": "",
@@ -21,6 +22,7 @@
     "express": "^5.1.0",
     "socket.io": "^4.8.1",
     "ts-node": "^10.9.2",
+    "pg": "^8.11.0",
     "typescript": "^5.9.3"
   }
 }
