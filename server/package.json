@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "vercel dev",
+    "dev": "ts-node src/index.ts",
     "start": "vercel dev",
     "build": "echo 'Serverless functions, no build needed"
   },
