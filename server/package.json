@@ -7,8 +7,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "ts-node src/index.ts",
-    "start": "vercel dev",
-    "build": "ts-node src/index.ts"
+    "start": "ts-node src/index.ts",
+    "build": "echo 'no build needed'"
   },
   "keywords": [],
   "author": "",
