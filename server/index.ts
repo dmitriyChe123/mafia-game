@@ -3,22 +3,30 @@ import cors from "cors";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import { Pool } from "pg";
-import { supabase } from "./supabase.js";
+import { createClient } from "@supabase/supabase-js";
 
-console.log("Supabase URL:", process.env.SUPABASE_URL);
+// Ініціалізація Supabase
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+export const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Потім у коді можна робити запити
+console.log("Supabase URL:", supabaseUrl);
+
+// Тест Supabase
 async function testSupabase() {
     const { data, error } = await supabase.from("rooms").select("*");
-    if (error) console.error(error);
-    else console.log(data);
+    if (error) console.error("Supabase error:", error);
+    else console.log("Supabase rooms:", data);
 }
 
 testSupabase();
+
+// Express
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Postgres
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
 });
@@ -32,11 +40,12 @@ app.get("/api/test-db", async (req, res) => {
     }
 });
 
+// HTTP + Socket.IO
 const httpServer = createServer(app);
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
-// Зберігаємо стан кімнат в пам'яті
-const rooms: Record<string, any> = {};
+// В пам'яті стан кімнат
+const rooms = {};
 
 io.on("connection", (socket) => {
     console.log("New WS connection:", socket.id);
@@ -44,28 +53,25 @@ io.on("connection", (socket) => {
     socket.on("join", async ({ roomId, player }) => {
         socket.join(roomId);
 
-        // Якщо кімната нова, створюємо
         if (!rooms[roomId]) rooms[roomId] = { players: [], state: {} };
         rooms[roomId].players.push(player);
 
         // Зберігаємо в Supabase
         await supabase.from("rooms").upsert({ id: roomId, state: rooms[roomId].state });
 
-        // Відправляємо оновлення всім у кімнаті
+        // Відправляємо всім
         io.to(roomId).emit("roomUpdate", rooms[roomId]);
     });
 
     socket.on("action", async ({ roomId, action }) => {
-        // Оновлюємо стан кімнати
         rooms[roomId].state = { ...rooms[roomId].state, ...action };
 
-        // Зберігаємо в Supabase
         await supabase.from("rooms").upsert({ id: roomId, state: rooms[roomId].state });
 
-        // Відправляємо оновлення всім гравцям
         io.to(roomId).emit("roomUpdate", rooms[roomId]);
     });
 });
 
+// Старт сервера
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));
