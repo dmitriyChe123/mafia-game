@@ -7,7 +7,7 @@ import { createClient } from "@supabase/supabase-js";
 
 // Гарантовано беремо строки з env
 const supabaseUrl = process.env.SUPABASE_URL!;
-const supabaseKey = process.env.SUPABASE_ANON_KEY!;
+const supabaseKey = process.env.SUPABASE_KEY!;
 
 export const supabase = createClient(supabaseUrl, supabaseKey);
 
