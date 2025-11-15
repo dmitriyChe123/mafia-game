@@ -1,7 +1,7 @@
 {
   "name": "mafia-server",
   "version": "1.0.0",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
     "build": "tsc",
     "dev": "ts-node index.ts",
