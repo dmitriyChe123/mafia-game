@@ -1,10 +1,12 @@
 {
   "compilerOptions": {
     "target": "ES2020",
-    "module": "ES2020",
+    "module": "CommonJS",
     "moduleResolution": "node",
     "outDir": "dist",
+    "rootDir": ".",
     "esModuleInterop": true,
     "strict": true
-  }
+  },
+  "include": ["index.ts", "supabase.js", "api/**/*.ts"]
 }
