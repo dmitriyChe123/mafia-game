@@ -5,7 +5,7 @@ import { createClient } from '@supabase/supabase-js';
 
 // Беремо змінні оточення
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.REACT_APP_SUPABASE_ANON_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 // Перевірка на наявність
 if (!supabaseUrl || !supabaseKey) {

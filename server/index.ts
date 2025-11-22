@@ -4,7 +4,7 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 // --- ENV ---
 const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_KEY = process.env.REACT_APP_SUPABASE_ANON_KEY!;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const PORT = process.env.PORT || 3001;
 
 // --- INIT ---
