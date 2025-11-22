@@ -1,76 +1,66 @@
 import express from "express";
 import cors from "cors";
-import { createServer } from "http";
-import { Server } from "socket.io";
-import { Pool } from "pg";
 import { createClient } from "@supabase/supabase-js";
 
-// Гарантовано беремо строки з env
-const supabaseUrl = process.env.SUPABASE_URL!;
-const supabaseKey = process.env.SUPABASE_KEY!;
+// --- ENV ---
+const SUPABASE_URL = process.env.SUPABASE_URL!;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const PORT = process.env.PORT || 3001;
 
-export const supabase = createClient(supabaseUrl, supabaseKey);
-
-// TypeScript типізація для кімнат
-interface Room {
-    players: string[];
-    state: Record<string, any>;
-}
-
-const rooms: Record<string, Room> = {};
-
-console.log("Supabase URL:", supabaseUrl);
-
-async function testSupabase() {
-    const { data, error } = await supabase.from("rooms").select("*");
-    if (error) console.error(error);
-    else console.log(data);
-}
-
-testSupabase();
-
+// --- INIT ---
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
+export const supa = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// --- ROUTES ---
+app.get("/health", (req, res) => {
+    res.json({ ok: true });
 });
 
-app.get("/api/test-db", async (req, res) => {
-    try {
-        const result = await pool.query("SELECT NOW()");
-        res.json({ ok: true, time: result.rows[0] });
-    } catch (e) {
-        res.status(500).json({ error: String(e) });
-    }
+// Create room
+app.post("/rooms", async (req, res) => {
+    const { hostUserId } = req.body;
+
+    const { data, error } = await supa
+        .from("rooms")
+        .insert([{ host_user_id: hostUserId }])
+        .select()
+        .single();
+
+    if (error) return res.status(400).json({ error });
+    res.json(data);
 });
 
-const httpServer = createServer(app);
-const io = new Server(httpServer, { cors: { origin: "*" } });
+// Join room
+app.post("/rooms/join", async (req, res) => {
+    const { roomId, userId } = req.body;
 
-io.on("connection", (socket) => {
-    console.log("New WS connection:", socket.id);
+    const { data, error } = await supa
+        .from("players_in_room")
+        .insert([{ room_id: roomId, user_id: userId }])
+        .select()
+        .single();
 
-    socket.on("join", async ({ roomId, player }: { roomId: string; player: string }) => {
-        socket.join(roomId);
-
-        if (!rooms[roomId]) rooms[roomId] = { players: [], state: {} };
-        rooms[roomId].players.push(player);
-
-        await supabase.from("rooms").upsert({ id: roomId, state: rooms[roomId].state });
-
-        io.to(roomId).emit("roomUpdate", rooms[roomId]);
-    });
-
-    socket.on("action", async ({ roomId, action }: { roomId: string; action: Record<string, any> }) => {
-        rooms[roomId].state = { ...rooms[roomId].state, ...action };
-
-        await supabase.from("rooms").upsert({ id: roomId, state: rooms[roomId].state });
-
-        io.to(roomId).emit("roomUpdate", rooms[roomId]);
-    });
+    if (error) return res.status(400).json({ error });
+    res.json(data);
 });
 
-const PORT = process.env.PORT || 3000;
-httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Get room players
+app.get("/rooms/:id/players", async (req, res) => {
+    const roomId = req.params.id;
+
+    const { data, error } = await supa
+        .from("players_in_room")
+        .select("*, users(*)")
+        .eq("room_id", roomId);
+
+    if (error) return res.status(400).json({ error });
+    res.json(data);
+});
+
+// --- START SERVER ---
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
