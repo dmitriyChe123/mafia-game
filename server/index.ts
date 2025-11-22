@@ -1,6 +1,6 @@
-import express from "express";
+import express, { Request, Response } from "express";
 import cors from "cors";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 // --- ENV ---
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -9,55 +9,81 @@ const PORT = process.env.PORT || 3001;
 
 // --- INIT ---
 const app = express();
-app.use(cors());
+app.use(
+    cors({
+        origin: "https://mafia-game-beta.vercel.app",
+    })
+);
 app.use(express.json());
 
-export const supa = createClient(SUPABASE_URL, SUPABASE_KEY);
+export const supa: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// --- TYPES ---
+interface CreateRoomBody {
+    hostUserId: string;
+}
+
+interface JoinRoomBody {
+    roomId: string;
+    userId: string;
+}
 
 // --- ROUTES ---
-app.get("/health", (req, res) => {
+app.get("/health", (_req: Request, res: Response) => {
     res.json({ ok: true });
 });
 
 // Create room
-app.post("/rooms", async (req, res) => {
-    const { hostUserId } = req.body;
+app.post("/rooms", async (req: Request<{}, {}, CreateRoomBody>, res: Response) => {
+    try {
+        const { hostUserId } = req.body;
 
-    const { data, error } = await supa
-        .from("rooms")
-        .insert([{ host_user_id: hostUserId }])
-        .select()
-        .single();
+        const { data, error } = await supa
+            .from("rooms")
+            .insert([{ host_user_id: hostUserId }])
+            .select()
+            .single();
 
-    if (error) return res.status(400).json({ error });
-    res.json(data);
+        if (error) throw error;
+        res.json({ ok: true, data });
+    } catch (err: any) {
+        res.status(400).json({ ok: false, error: err.message });
+    }
 });
 
 // Join room
-app.post("/rooms/join", async (req, res) => {
-    const { roomId, userId } = req.body;
+app.post("/rooms/join", async (req: Request<{}, {}, JoinRoomBody>, res: Response) => {
+    try {
+        const { roomId, userId } = req.body;
 
-    const { data, error } = await supa
-        .from("players_in_room")
-        .insert([{ room_id: roomId, user_id: userId }])
-        .select()
-        .single();
+        const { data, error } = await supa
+            .from("players_in_room")
+            .insert([{ room_id: roomId, user_id: userId }])
+            .select()
+            .single();
 
-    if (error) return res.status(400).json({ error });
-    res.json(data);
+        if (error) throw error;
+        res.json({ ok: true, data });
+    } catch (err: any) {
+        res.status(400).json({ ok: false, error: err.message });
+    }
 });
 
 // Get room players
-app.get("/rooms/:id/players", async (req, res) => {
-    const roomId = req.params.id;
+app.get("/rooms/:id/players", async (req: Request, res: Response) => {
+    try {
+        const roomId = req.params.id;
 
-    const { data, error } = await supa
-        .from("players_in_room")
-        .select("*, users(*)")
-        .eq("room_id", roomId);
+        const { data, error } = await supa
+            .from("players_in_room")
+            .select("*, users(*)")
+            .eq("room_id", roomId);
 
-    if (error) return res.status(400).json({ error });
-    res.json(data);
+        if (error) throw error;
+        res.json({ ok: true, data });
+    } catch (err: any) {
+        res.status(400).json({ ok: false, error: err.message });
+    }
 });
 
 // --- START SERVER ---

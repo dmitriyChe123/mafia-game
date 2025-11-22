@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { RoomState } from '../types';
 import { useNavigate } from 'react-router-dom';
+const API = "https://YOUR_SERVER_URL";
 
 interface LobbyProps {
     onCreateRoom: (room: RoomState) => void;
