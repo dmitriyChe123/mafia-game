@@ -1,0 +1,3 @@
+console.log("SUPABASE_URL:", process.env.SUPABASE_URL);
+console.log("SUPABASE_SERVICE_ROLE_KEY:", process.env.SUPABASE_SERVICE_ROLE_KEY ? "OK" : "MISSING");
+console.log("DATABASE_URL:", process.env.DATABASE_URL ? "OK" : "MISSING");
