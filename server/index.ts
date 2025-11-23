@@ -85,6 +85,11 @@ app.get("/rooms/:id/players", async (req: Request, res: Response) => {
         res.status(400).json({ ok: false, error: err.message });
     }
 });
+// --- TEST SUPABASE CONNECTION ---
+(async () => {
+    const { data, error } = await supa.from("rooms").select("*").limit(1);
+    console.log("SUPABASE TEST:", { error, data });
+})();
 
 // --- START SERVER ---
 app.listen(PORT, () => {
