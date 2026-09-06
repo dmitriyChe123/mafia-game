@@ -8,5 +8,5 @@
     "esModuleInterop": true,
     "strict": true
   },
-  "include": ["index.ts", "supabase.js", "api/**/*.ts"]
+  "include": ["index.ts"]
 }

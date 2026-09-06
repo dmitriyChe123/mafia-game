@@ -1,197 +1,1744 @@
-import { useEffect, useState } from 'react';
-import { RoomState, Player, Role } from '../types';
-import { getCurrentPhase, nextPhase } from '../game/phaseManager';
+import { RoomTable } from './room/RoomTable';
+import { RoomSidebar } from './room/RoomSidebar';
+import { RoomConnectionBanner } from './room/RoomConnectionBanner';
+
+import {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from 'react';
+
+import { io, Socket } from 'socket.io-client';
+
+import { RoomState, Player } from '../types';
+
+import { nextPhase } from '../game/phaseManager';
+
 import { GAME_PHASES } from '../game/phases';
+
 import { assignRolesToPlayers } from '../game/roleAssigner';
+
+import { supabase } from '../supabase';
 
 interface RoomProps {
     room: RoomState;
     playerName: string;
 }
 
-export function Room({ room: initialRoom, playerName }: RoomProps) {
-    const [room, setRoom] = useState<RoomState>(initialRoom);
-    const [timer, setTimer] = useState<number | null>(null);
-    const [isPaused, setIsPaused] = useState(false);
-    const localPlayerId = localStorage.getItem('playerId');
-    //const isAdmin = localPlayerId === room.adminId;
-    const isAdmin = true;
+interface BackendPlayer {
+    id: string;
+    room_id: string;
+    user_id: string;
+    role: Player['role'] | null;
+    status: string;
+    joined_at: string;
 
-    // 🟢 Таймер
+    connection_status?:
+        | 'connected'
+        | 'disconnected';
+
+    last_seen_at?: string | null;
+
+    display_name?: string | null;
+
+    users: {
+        id: string;
+        name: string;
+        avatar_url: string | null;
+    } | null;
+}
+
+interface PlayersResponse {
+    ok: boolean;
+
+    room?: {
+        id: string;
+        admin_id: string;
+        status: string;
+    };
+
+    data?: BackendPlayer[];
+
+    error?: string;
+}
+
+interface SocketPeer {
+    socketId: string;
+    userId: string;
+}
+
+interface SignalMessage {
+    fromSocketId: string;
+    fromUserId: string;
+    type:
+        | 'offer'
+        | 'answer'
+        | 'ice-candidate';
+    data: any;
+}
+
+const API =
+    process.env.REACT_APP_API_URL ||
+    'http://localhost:3001';
+
+export function Room({
+                         room: initialRoom,
+                         playerName,
+                     }: RoomProps) {
+    const [room, setRoom] =
+        useState<RoomState>(initialRoom);
+
+    const [timer, setTimer] =
+        useState<number | null>(null);
+
+    const [isPaused, setIsPaused] =
+        useState(false);
+
+    const [loadingPlayers, setLoadingPlayers] =
+        useState(true);
+
+    const [currentUserId, setCurrentUserId] =
+        useState<string | null>(null);
+
+    const [localStream, setLocalStream] =
+        useState<MediaStream | null>(null);
+
+    const [
+        transferringAdminId,
+        setTransferringAdminId,
+    ] = useState<string | null>(null);
+
+    const [remoteStreams, setRemoteStreams] =
+        useState<Record<string, MediaStream>>({});
+
+    const [
+        disconnectedPlayerIds,
+        setDisconnectedPlayerIds,
+    ] = useState<string[]>([]);
+
+    const [connectionPaused, setConnectionPaused] =
+        useState(false);
+
+    const localStreamRef =
+        useRef<MediaStream | null>(null);
+
+    const socketRef =
+        useRef<Socket | null>(null);
+
+    const peerConnections =
+        useRef<Map<string, RTCPeerConnection>>(
+            new Map()
+        );
+
+    const peerSockets =
+        useRef<Map<string, string>>(new Map());
+
+    const pendingIceCandidates =
+        useRef<
+            Map<string, RTCIceCandidateInit[]>
+        >(new Map());
+
+    // ==================================================
+    // CURRENT USER
+    // ==================================================
+
     useEffect(() => {
-        const currentPhase = GAME_PHASES.find(p => p.key === room.phase);
-        if (currentPhase?.duration && currentPhase.hasTimer) {
-            setTimer(currentPhase.duration);
+        let mounted = true;
+
+        const loadUser = async () => {
+            const {
+                data: { user },
+            } =
+                await supabase.auth.getUser();
+
+            if (mounted && user) {
+                setCurrentUserId(user.id);
+            }
+        };
+
+        loadUser();
+
+        return () => {
+            mounted = false;
+        };
+    }, []);
+
+    // ==================================================
+    // ADMIN
+    // ==================================================
+
+    const isAdmin = useMemo(() => {
+        return (
+            !!currentUserId &&
+            currentUserId === room.adminId
+        );
+    }, [
+        currentUserId,
+        room.adminId,
+    ]);
+
+    // ==================================================
+    // LOAD PLAYERS
+    // ==================================================
+
+    const loadPlayers = useCallback(
+        async () => {
+            if (!room.id) return;
+
+            try {
+                const {
+                    data: { session },
+                } =
+                    await supabase.auth.getSession();
+
+                if (!session?.access_token) {
+                    return;
+                }
+
+                const response =
+                    await fetch(
+                        `${API}/rooms/${room.id}/players`,
+                        {
+                            headers: {
+                                Authorization:
+                                    `Bearer ${session.access_token}`,
+                            },
+                        }
+                    );
+
+                const result =
+                    (await response.json()) as PlayersResponse;
+
+                if (
+                    !response.ok ||
+                    !result.ok
+                ) {
+                    console.error(
+                        'LOAD PLAYERS ERROR:',
+                        result.error
+                    );
+
+                    return;
+                }
+
+                const backendPlayers =
+                    result.data || [];
+
+                const adminId =
+                    result.room?.admin_id ||
+                    room.adminId;
+
+                let number = 1;
+
+                const players: Player[] =
+                    backendPlayers.map(
+                        (item) => {
+                            const cleanName =
+                                item.display_name?.trim() ||
+                                item.users?.name?.trim();
+
+                            const player: Player = {
+                                id: item.user_id,
+
+                                name:
+                                    cleanName ||
+                                    'Player',
+
+                                alive:
+                                    item.status ===
+                                    'alive',
+
+                                role:
+                                    item.role ||
+                                    undefined,
+                            };
+
+                            if (
+                                player.id !==
+                                adminId
+                            ) {
+                                player.number =
+                                    number++;
+                            }
+
+                            return player;
+                        }
+                    );
+
+                setRoom((current) => ({
+                    ...current,
+                    players,
+                    adminId,
+                }));
+
+                const disconnectedIds =
+                    backendPlayers
+                        .filter(
+                            (item) =>
+                                item.connection_status ===
+                                'disconnected'
+                        )
+                        .map(
+                            (item) =>
+                                item.user_id
+                        );
+
+                setDisconnectedPlayerIds(
+                    disconnectedIds
+                );
+
+                if (
+                    disconnectedIds.length === 0
+                ) {
+                    setConnectionPaused(
+                        false
+                    );
+                }
+            } catch (error) {
+                console.error(
+                    'PLAYERS FETCH ERROR:',
+                    error
+                );
+            } finally {
+                setLoadingPlayers(false);
+            }
+        },
+        [
+            room.id,
+            room.adminId,
+        ]
+    );
+
+    useEffect(() => {
+        loadPlayers();
+
+        const interval =
+            window.setInterval(
+                loadPlayers,
+                2000
+            );
+
+        return () =>
+            window.clearInterval(
+                interval
+            );
+    }, [loadPlayers]);
+
+    // ==================================================
+    // CURRENT PLAYER
+    // ==================================================
+
+    const currentPlayer = useMemo(() => {
+        if (!currentUserId) {
+            return null;
+        }
+
+        return (
+            room.players.find(
+                (player) =>
+                    player.id ===
+                    currentUserId
+            ) || null
+        );
+    }, [
+        room.players,
+        currentUserId,
+    ]);
+
+    const currentPlayerIsDead =
+        currentPlayer
+            ? !currentPlayer.alive
+            : false;
+
+    // ==================================================
+    // DISCONNECTED PLAYERS
+    // ==================================================
+
+    const disconnectedPlayers =
+        useMemo(() => {
+            return room.players.filter(
+                (player) =>
+                    disconnectedPlayerIds.includes(
+                        player.id
+                    )
+            );
+        }, [
+            room.players,
+            disconnectedPlayerIds,
+        ]);
+
+    // ==================================================
+    // CAMERA
+    // ==================================================
+
+    useEffect(() => {
+        let mounted = true;
+
+        const startMedia = async () => {
+            try {
+                const stream =
+                    await navigator.mediaDevices.getUserMedia(
+                        {
+                            video: true,
+                            audio: true,
+                        }
+                    );
+
+                if (!mounted) {
+                    stream
+                        .getTracks()
+                        .forEach(
+                            (track) =>
+                                track.stop()
+                        );
+
+                    return;
+                }
+
+                localStreamRef.current =
+                    stream;
+
+                setLocalStream(stream);
+            } catch (error) {
+                console.error(
+                    'MEDIA ERROR:',
+                    error
+                );
+            }
+        };
+
+        startMedia();
+
+        return () => {
+            mounted = false;
+
+            localStreamRef.current
+                ?.getTracks()
+                .forEach(
+                    (track) =>
+                        track.stop()
+                );
+
+            localStreamRef.current = null;
+        };
+    }, []);
+
+    // ==================================================
+    // DEAD => MIC OFF
+    // ==================================================
+
+    useEffect(() => {
+        if (!localStream) return;
+
+        localStream
+            .getAudioTracks()
+            .forEach((track) => {
+                track.enabled =
+                    !currentPlayerIsDead;
+            });
+    }, [
+        localStream,
+        currentPlayerIsDead,
+    ]);
+
+    // ==================================================
+    // WEBRTC HELPERS
+    // ==================================================
+
+    const closePeer = useCallback(
+        (userId: string) => {
+            const pc =
+                peerConnections.current.get(
+                    userId
+                );
+
+            if (pc) {
+                pc.ontrack = null;
+                pc.onicecandidate = null;
+                pc.onconnectionstatechange =
+                    null;
+
+                pc.close();
+            }
+
+            peerConnections.current.delete(
+                userId
+            );
+
+            peerSockets.current.delete(
+                userId
+            );
+
+            pendingIceCandidates.current.delete(
+                userId
+            );
+
+            setRemoteStreams(
+                (current) => {
+                    const next = {
+                        ...current,
+                    };
+
+                    delete next[userId];
+
+                    return next;
+                }
+            );
+        },
+        []
+    );
+
+    const createPeerConnection =
+        useCallback(
+            (
+                peerUserId: string,
+                peerSocketId: string
+            ) => {
+                const existing =
+                    peerConnections.current.get(
+                        peerUserId
+                    );
+
+                if (existing) {
+                    peerSockets.current.set(
+                        peerUserId,
+                        peerSocketId
+                    );
+
+                    return existing;
+                }
+
+                console.log(
+                    '[WEBRTC] creating peer connection:',
+                    peerUserId
+                );
+
+                const pc =
+                    new RTCPeerConnection({
+                        iceServers: [
+                            {
+                                urls:
+                                    'stun:stun.l.google.com:19302',
+                            },
+                        ],
+                    });
+
+                peerConnections.current.set(
+                    peerUserId,
+                    pc
+                );
+
+                peerSockets.current.set(
+                    peerUserId,
+                    peerSocketId
+                );
+
+                if (
+                    localStreamRef.current
+                ) {
+                    localStreamRef.current
+                        .getTracks()
+                        .forEach((track) => {
+                            pc.addTrack(
+                                track,
+                                localStreamRef.current!
+                            );
+                        });
+                }
+
+                pc.onicecandidate = (
+                    event
+                ) => {
+                    if (
+                        !event.candidate
+                    ) {
+                        return;
+                    }
+
+                    socketRef.current?.emit(
+                        'webrtc-signal',
+                        {
+                            to: peerSocketId,
+                            type: 'ice-candidate',
+                            data: event.candidate.toJSON(),
+                        }
+                    );
+                };
+
+                pc.ontrack = (event) => {
+                    const stream =
+                        event.streams[0];
+
+                    if (!stream) {
+                        return;
+                    }
+
+                    console.log(
+                        '[WEBRTC] remote stream received:',
+                        peerUserId
+                    );
+
+                    setRemoteStreams(
+                        (current) => ({
+                            ...current,
+                            [peerUserId]:
+                            stream,
+                        })
+                    );
+                };
+
+                pc.onconnectionstatechange =
+                    () => {
+                        console.log(
+                            '[WEBRTC]',
+                            peerUserId,
+                            'connection:',
+                            pc.connectionState
+                        );
+
+                        if (
+                            pc.connectionState ===
+                            'failed' ||
+                            pc.connectionState ===
+                            'closed' ||
+                            pc.connectionState ===
+                            'disconnected'
+                        ) {
+                            closePeer(
+                                peerUserId
+                            );
+                        }
+                    };
+
+                return pc;
+            },
+            [closePeer]
+        );
+
+    const createOffer = useCallback(
+        async (
+            peerUserId: string,
+            peerSocketId: string
+        ) => {
+            const pc =
+                createPeerConnection(
+                    peerUserId,
+                    peerSocketId
+                );
+
+            try {
+                const offer =
+                    await pc.createOffer();
+
+                await pc.setLocalDescription(
+                    offer
+                );
+
+                socketRef.current?.emit(
+                    'webrtc-signal',
+                    {
+                        to: peerSocketId,
+                        type: 'offer',
+                        data: offer,
+                    }
+                );
+            } catch (error) {
+                console.error(
+                    'CREATE OFFER ERROR:',
+                    error
+                );
+            }
+        },
+        [createPeerConnection]
+    );
+
+    // ==================================================
+    // SOCKET.IO + WEBRTC
+    // ==================================================
+
+    useEffect(() => {
+        if (
+            !currentUserId ||
+            !localStream
+        ) {
+            return;
+        }
+
+        let cancelled = false;
+
+        const connectSocket =
+            async () => {
+                const {
+                    data: { session },
+                } =
+                    await supabase.auth.getSession();
+
+                if (
+                    cancelled ||
+                    !session?.access_token
+                ) {
+                    return;
+                }
+
+                const socket = io(API, {
+                    transports: [
+                        'websocket',
+                    ],
+                    auth: {
+                        token:
+                        session.access_token,
+                    },
+                });
+
+                socketRef.current =
+                    socket;
+
+                socket.on(
+                    'connect',
+                    () => {
+                        console.log(
+                            '[WEBRTC] socket connected'
+                        );
+
+                        socket.emit(
+                            'join-room',
+                            room.id
+                        );
+                    }
+                );
+
+                socket.on(
+                    'room-error',
+                    (
+                        message: string
+                    ) => {
+                        console.error(
+                            '[WEBRTC] room error:',
+                            message
+                        );
+                    }
+                );
+
+                socket.on(
+                    'room-peers',
+                    async (
+                        peers: SocketPeer[]
+                    ) => {
+                        for (
+                            const peer of peers
+                            ) {
+                            if (
+                                peer.userId ===
+                                currentUserId
+                            ) {
+                                continue;
+                            }
+
+                            peerSockets.current.set(
+                                peer.userId,
+                                peer.socketId
+                            );
+
+                            createPeerConnection(
+                                peer.userId,
+                                peer.socketId
+                            );
+
+                            if (
+                                currentUserId <
+                                peer.userId
+                            ) {
+                                await createOffer(
+                                    peer.userId,
+                                    peer.socketId
+                                );
+                            }
+                        }
+                    }
+                );
+
+                socket.on(
+                    'peer-joined',
+                    async (
+                        peer: SocketPeer
+                    ) => {
+                        if (
+                            peer.userId ===
+                            currentUserId
+                        ) {
+                            return;
+                        }
+
+                        peerSockets.current.set(
+                            peer.userId,
+                            peer.socketId
+                        );
+
+                        createPeerConnection(
+                            peer.userId,
+                            peer.socketId
+                        );
+
+                        if (
+                            currentUserId <
+                            peer.userId
+                        ) {
+                            await createOffer(
+                                peer.userId,
+                                peer.socketId
+                            );
+                        }
+                    }
+                );
+
+                socket.on(
+                    'webrtc-signal',
+                    async (
+                        signal: SignalMessage
+                    ) => {
+                        const {
+                            fromUserId,
+                            fromSocketId,
+                            type,
+                            data,
+                        } = signal;
+
+                        if (
+                            fromUserId ===
+                            currentUserId
+                        ) {
+                            return;
+                        }
+
+                        console.log(
+                            '[WEBRTC] signal:',
+                            type,
+                            'from:',
+                            fromUserId
+                        );
+
+                        peerSockets.current.set(
+                            fromUserId,
+                            fromSocketId
+                        );
+
+                        if (
+                            type ===
+                            'offer'
+                        ) {
+                            const pc =
+                                createPeerConnection(
+                                    fromUserId,
+                                    fromSocketId
+                                );
+
+                            try {
+                                await pc.setRemoteDescription(
+                                    new RTCSessionDescription(
+                                        data
+                                    )
+                                );
+
+                                const queued =
+                                    pendingIceCandidates.current.get(
+                                        fromUserId
+                                    ) || [];
+
+                                for (
+                                    const candidate of queued
+                                    ) {
+                                    try {
+                                        await pc.addIceCandidate(
+                                            new RTCIceCandidate(
+                                                candidate
+                                            )
+                                        );
+                                    } catch (
+                                        error
+                                        ) {
+                                        console.error(
+                                            '[WEBRTC] queued ICE error:',
+                                            error
+                                        );
+                                    }
+                                }
+
+                                pendingIceCandidates.current.delete(
+                                    fromUserId
+                                );
+
+                                const answer =
+                                    await pc.createAnswer();
+
+                                await pc.setLocalDescription(
+                                    answer
+                                );
+
+                                socket.emit(
+                                    'webrtc-signal',
+                                    {
+                                        to: fromSocketId,
+                                        type: 'answer',
+                                        data: answer,
+                                    }
+                                );
+                            } catch (
+                                error
+                                ) {
+                                console.error(
+                                    '[WEBRTC] HANDLE OFFER ERROR:',
+                                    error
+                                );
+                            }
+
+                            return;
+                        }
+
+                        if (
+                            type ===
+                            'answer'
+                        ) {
+                            const pc =
+                                peerConnections.current.get(
+                                    fromUserId
+                                );
+
+                            if (!pc) {
+                                console.warn(
+                                    '[WEBRTC] answer received but PC missing:',
+                                    fromUserId
+                                );
+
+                                return;
+                            }
+
+                            try {
+                                await pc.setRemoteDescription(
+                                    new RTCSessionDescription(
+                                        data
+                                    )
+                                );
+
+                                const queued =
+                                    pendingIceCandidates.current.get(
+                                        fromUserId
+                                    ) || [];
+
+                                for (
+                                    const candidate of queued
+                                    ) {
+                                    try {
+                                        await pc.addIceCandidate(
+                                            new RTCIceCandidate(
+                                                candidate
+                                            )
+                                        );
+                                    } catch (
+                                        error
+                                        ) {
+                                        console.error(
+                                            '[WEBRTC] queued ICE error:',
+                                            error
+                                        );
+                                    }
+                                }
+
+                                pendingIceCandidates.current.delete(
+                                    fromUserId
+                                );
+                            } catch (
+                                error
+                                ) {
+                                console.error(
+                                    '[WEBRTC] HANDLE ANSWER ERROR:',
+                                    error
+                                );
+                            }
+
+                            return;
+                        }
+
+                        if (
+                            type ===
+                            'ice-candidate'
+                        ) {
+                            const pc =
+                                peerConnections.current.get(
+                                    fromUserId
+                                );
+
+                            if (!pc) {
+                                console.warn(
+                                    '[WEBRTC] ICE received but PC missing:',
+                                    fromUserId
+                                );
+
+                                return;
+                            }
+
+                            const candidate =
+                                data as RTCIceCandidateInit;
+
+                            if (
+                                !pc.remoteDescription
+                            ) {
+                                const queue =
+                                    pendingIceCandidates.current.get(
+                                        fromUserId
+                                    ) || [];
+
+                                queue.push(
+                                    candidate
+                                );
+
+                                pendingIceCandidates.current.set(
+                                    fromUserId,
+                                    queue
+                                );
+
+                                return;
+                            }
+
+                            try {
+                                await pc.addIceCandidate(
+                                    new RTCIceCandidate(
+                                        candidate
+                                    )
+                                );
+                            } catch (
+                                error
+                                ) {
+                                console.error(
+                                    '[WEBRTC] ICE ERROR:',
+                                    error
+                                );
+                            }
+                        }
+                    }
+                );
+
+                socket.on(
+                    'peer-left',
+                    ({
+                         userId,
+                     }: {
+                        userId: string;
+                    }) => {
+                        closePeer(userId);
+                    }
+                );
+
+                socket.on(
+                    'player-disconnected',
+                    ({
+                         userId,
+                     }: {
+                        userId: string;
+                    }) => {
+                        console.log(
+                            '[ROOM] player disconnected:',
+                            userId
+                        );
+
+                        setDisconnectedPlayerIds(
+                            (current) => {
+                                if (
+                                    current.includes(
+                                        userId
+                                    )
+                                ) {
+                                    return current;
+                                }
+
+                                return [
+                                    ...current,
+                                    userId,
+                                ];
+                            }
+                        );
+
+                        setConnectionPaused(
+                            true
+                        );
+
+                        setIsPaused(true);
+
+                        closePeer(userId);
+                    }
+                );
+
+                socket.on(
+                    'player-reconnected',
+                    ({
+                         userId,
+                     }: {
+                        userId: string;
+                    }) => {
+                        console.log(
+                            '[ROOM] player reconnected:',
+                            userId
+                        );
+
+                        setDisconnectedPlayerIds(
+                            (current) =>
+                                current.filter(
+                                    (id) =>
+                                        id !==
+                                        userId
+                                )
+                        );
+                    }
+                );
+
+                socket.on(
+                    'game-connection-paused',
+                    () => {
+                        console.log(
+                            '[ROOM] GAME PAUSED'
+                        );
+
+                        setConnectionPaused(
+                            true
+                        );
+
+                        setIsPaused(true);
+                    }
+                );
+
+                socket.on(
+                    'game-connection-resumed',
+                    () => {
+                        console.log(
+                            '[ROOM] GAME RESUMED'
+                        );
+
+                        setConnectionPaused(
+                            false
+                        );
+
+                        setIsPaused(false);
+
+                        setDisconnectedPlayerIds(
+                            []
+                        );
+                    }
+                );
+
+                socket.on(
+                    'room-admin-changed',
+                    ({
+                         adminId,
+                     }: {
+                        adminId: string;
+                    }) => {
+                        setRoom(
+                            (current) => ({
+                                ...current,
+                                adminId,
+                            })
+                        );
+                    }
+                );
+
+                socket.on(
+                    'game-started',
+                    () => {
+                        console.log(
+                            '[ROOM] GAME STARTED'
+                        );
+
+                        setRoom(
+                            (current) => ({
+                                ...current,
+                                phase: 'night',
+                                currentPhaseIndex: 0,
+                            })
+                        );
+                    }
+                );
+            };
+
+        connectSocket();
+
+        return () => {
+            cancelled = true;
+
+            const socket =
+                socketRef.current;
+
+            if (socket) {
+                socket.disconnect();
+            }
+
+            socketRef.current = null;
+
+            peerConnections.current.forEach(
+                (pc) => pc.close()
+            );
+
+            peerConnections.current.clear();
+
+            peerSockets.current.clear();
+
+            pendingIceCandidates.current.clear();
+
+            setRemoteStreams({});
+        };
+    }, [
+        currentUserId,
+        localStream,
+        room.id,
+        createPeerConnection,
+        createOffer,
+        closePeer,
+    ]);
+
+    // ==================================================
+    // TIMER INITIALIZATION
+    // ==================================================
+
+    useEffect(() => {
+        const currentPhase =
+            GAME_PHASES.find(
+                (phase) =>
+                    phase.key === room.phase
+            );
+
+        if (
+            currentPhase?.duration &&
+            currentPhase.hasTimer
+        ) {
+            setTimer(
+                currentPhase.duration
+            );
         } else {
             setTimer(null);
         }
     }, [room.phase]);
 
+    // ==================================================
+    // NEXT PHASE
+    // ==================================================
+
+    const handleNextPhase =
+        useCallback(() => {
+            if (!isAdmin) return;
+
+            const updated =
+                nextPhase(room);
+
+            setRoom(updated);
+        }, [
+            isAdmin,
+            room,
+        ]);
+
+    // ==================================================
+    // TIMER
+    // ==================================================
+
     useEffect(() => {
-        if (!timer || isPaused) return;
-        const interval = setInterval(() => {
-            setTimer(prev => {
-                if (!prev || prev <= 1) {
-                    clearInterval(interval);
-                    if (isAdmin) handleNextPhase();
-                    return 0;
-                }
-                return prev - 1;
-            });
-        }, 1000);
-        return () => clearInterval(interval);
-    }, [timer, isPaused]);
+        if (
+            timer === null ||
+            isPaused
+        ) {
+            return;
+        }
 
-    // 🟢 Початок гри
-    const handleStart = () => {
-        if (!isAdmin || room.phase !== 'lobby') return;
+        const interval =
+            window.setInterval(() => {
+                setTimer((prev) => {
+                    if (
+                        prev === null ||
+                        prev <= 1
+                    ) {
+                        window.clearInterval(
+                            interval
+                        );
 
-        if (room.phase !== 'lobby') return;
+                        if (isAdmin) {
+                            handleNextPhase();
+                        }
 
-        // 🧩 Генеруємо розподіл ролей
-        const playersWithRoles = assignRolesToPlayers(room.players);
+                        return 0;
+                    }
 
-        const updatedRoom: RoomState = {
-            ...room,
-            players: playersWithRoles,
-            phase: 'night',
-            currentPhaseIndex: 0,
-        };
+                    return prev - 1;
+                });
+            }, 1000);
 
-        setRoom(updatedRoom);
-        localStorage.setItem(`room_${updatedRoom.id}`, JSON.stringify(updatedRoom));
+        return () =>
+            window.clearInterval(
+                interval
+            );
+    }, [
+        timer,
+        isPaused,
+        isAdmin,
+        handleNextPhase,
+    ]);
 
-        window.dispatchEvent(
-            new StorageEvent('storage', {
-                key: `room_${updatedRoom.id}`,
-                newValue: JSON.stringify(updatedRoom),
-            })
-        );
-    };
+    // ==================================================
+    // START GAME
+    // ==================================================
 
-    const handleNextPhase = () => {
-        if (!isAdmin) return;
-        const updated = nextPhase(room);
-        setRoom(updated);
-        localStorage.setItem(`room_${updated.id}`, JSON.stringify(updated));
-    };
+    const handleStart = async () => {
+        if (
+            !isAdmin ||
+            room.phase !== 'lobby'
+        ) {
+            return;
+        }
 
-    const handleRepeatPhase = () => {
-        const current = GAME_PHASES.find(p => p.key === room.phase);
-        if (current?.duration) setTimer(current.duration);
-    };
+        if (
+            room.players.length < 2
+        ) {
+            alert(
+                'Для початку гри потрібно щонайменше 2 гравці.'
+            );
 
-    const handleCopyId = async () => {
+            return;
+        }
+
         try {
-            await navigator.clipboard.writeText(room.id);
-            alert('Room ID скопійовано!');
-        } catch {
-            alert('Помилка копіювання');
+            const {
+                data: { session },
+            } =
+                await supabase.auth.getSession();
+
+            if (!session?.access_token) {
+                throw new Error(
+                    'Сесія користувача не знайдена'
+                );
+            }
+
+            const response =
+                await fetch(
+                    `${API}/rooms/${room.id}/start`,
+                    {
+                        method: 'POST',
+
+                        headers: {
+                            Authorization:
+                                `Bearer ${session.access_token}`,
+                        },
+                    }
+                );
+
+            const result =
+                await response.json();
+
+            if (
+                !response.ok ||
+                !result.ok
+            ) {
+                throw new Error(
+                    result.error ||
+                    'Не вдалося розпочати гру'
+                );
+            }
+
+            const playersWithRoles =
+                assignRolesToPlayers(
+                    room.players
+                );
+
+            setRoom({
+                ...room,
+
+                players:
+                playersWithRoles,
+
+                phase: 'night',
+
+                currentPhaseIndex: 0,
+            });
+        } catch (error) {
+            console.error(
+                'START GAME ERROR:',
+                error
+            );
+
+            alert(
+                error instanceof Error
+                    ? error.message
+                    : 'Помилка запуску гри'
+            );
         }
     };
 
+    // ==================================================
+    // REPEAT
+    // ==================================================
+
+    const handleRepeatPhase = () => {
+        const current =
+            GAME_PHASES.find(
+                (phase) =>
+                    phase.key === room.phase
+            );
+
+        if (current?.duration) {
+            setTimer(
+                current.duration
+            );
+        }
+    };
+
+    // ==================================================
+    // COPY
+    // ==================================================
+
+    const handleCopyId = async () => {
+        try {
+            await navigator.clipboard.writeText(
+                room.id
+            );
+
+            alert(
+                'Room ID скопійовано!'
+            );
+        } catch {
+            alert(
+                'Помилка копіювання'
+            );
+        }
+    };
+
+    // ==================================================
+    // TRANSFER ADMIN
+    // ==================================================
+
+    const handleMakeAdmin =
+        async (
+            newAdminId: string
+        ) => {
+            if (
+                !isAdmin ||
+                room.phase !== 'lobby'
+            ) {
+                return;
+            }
+
+            const player =
+                room.players.find(
+                    (item) =>
+                        item.id ===
+                        newAdminId
+                );
+
+            if (!player) return;
+
+            const confirmed =
+                window.confirm(
+                    `Передати права адміністратора гравцю "${player.name}"?`
+                );
+
+            if (!confirmed) return;
+
+            try {
+                setTransferringAdminId(
+                    newAdminId
+                );
+
+                const {
+                    data: { session },
+                } =
+                    await supabase.auth.getSession();
+
+                if (!session?.access_token) {
+                    throw new Error(
+                        'Сесія користувача не знайдена'
+                    );
+                }
+
+                const response =
+                    await fetch(
+                        `${API}/rooms/${room.id}/admin`,
+                        {
+                            method: 'POST',
+
+                            headers: {
+                                'Content-Type':
+                                    'application/json',
+
+                                Authorization:
+                                    `Bearer ${session.access_token}`,
+                            },
+
+                            body: JSON.stringify({
+                                newAdminId,
+                            }),
+                        }
+                    );
+
+                const result =
+                    await response.json();
+
+                if (
+                    !response.ok ||
+                    !result.ok
+                ) {
+                    throw new Error(
+                        result.error ||
+                        'Не вдалося передати адмінство'
+                    );
+                }
+
+                setRoom((current) => {
+                    let number = 1;
+
+                    const players =
+                        current.players.map(
+                            (item) => {
+                                if (
+                                    item.id ===
+                                    newAdminId
+                                ) {
+                                    return {
+                                        ...item,
+                                        number:
+                                        undefined,
+                                    };
+                                }
+
+                                return {
+                                    ...item,
+                                    number:
+                                        number++,
+                                };
+                            }
+                        );
+
+                    return {
+                        ...current,
+
+                        adminId:
+                        newAdminId,
+
+                        players,
+                    };
+                });
+            } catch (error) {
+                console.error(
+                    'TRANSFER ADMIN ERROR:',
+                    error
+                );
+
+                alert(
+                    error instanceof Error
+                        ? error.message
+                        : 'Помилка передачі адмінства'
+                );
+            } finally {
+                setTransferringAdminId(
+                    null
+                );
+            }
+        };
+
+    // ==================================================
+    // LOGOUT / EXPLICIT LEAVE
+    // ==================================================
+
+    const handleLogout = async () => {
+        try {
+            const {
+                data: { session },
+            } =
+                await supabase.auth.getSession();
+
+            if (session?.access_token) {
+                try {
+                    await fetch(
+                        `${API}/rooms/${room.id}/leave`,
+                        {
+                            method: 'DELETE',
+
+                            headers: {
+                                Authorization:
+                                    `Bearer ${session.access_token}`,
+                            },
+                        }
+                    );
+                } catch (error) {
+                    console.error(
+                        'ROOM LEAVE ERROR:',
+                        error
+                    );
+                }
+            }
+
+            socketRef.current?.emit(
+                'leave-room'
+            );
+
+            socketRef.current?.disconnect();
+
+            socketRef.current = null;
+
+            peerConnections.current.forEach(
+                (pc) => pc.close()
+            );
+
+            peerConnections.current.clear();
+
+            peerSockets.current.clear();
+
+            pendingIceCandidates.current.clear();
+
+            localStreamRef.current
+                ?.getTracks()
+                .forEach(
+                    (track) =>
+                        track.stop()
+                );
+
+            localStreamRef.current = null;
+
+            setLocalStream(null);
+            setRemoteStreams({});
+
+            await supabase.auth.signOut();
+
+            localStorage.removeItem(
+                'roomId'
+            );
+
+            localStorage.removeItem(
+                `room_${room.id}`
+            );
+
+            window.location.href = '/';
+        } catch (error) {
+            console.error(
+                'LOGOUT ERROR:',
+                error
+            );
+
+            try {
+                await supabase.auth.signOut();
+            } catch {
+                // ignore
+            }
+
+            localStorage.removeItem(
+                'roomId'
+            );
+
+            window.location.href = '/';
+        }
+    };
+
+    // ==================================================
+    // CONNECTION DECISION
+    // ==================================================
+
+    const handleConnectionDecision = (
+        decision:
+            | 'wait'
+            | 'continue'
+    ) => {
+        if (!isAdmin) {
+            return;
+        }
+
+        socketRef.current?.emit(
+            'connection-decision',
+            decision
+        );
+    };
+
+    // ==================================================
+    // LAYOUT
+    // ==================================================
+
+    const isSmallRoom =
+        room.players.filter(
+            (player) =>
+                player.id !==
+                room.adminId
+        ).length <= 8;
+
+    // ==================================================
+    // STREAM
+    // ==================================================
+
+    const getPlayerStream = (
+        player: Player
+    ): MediaStream | null => {
+        if (
+            player.id ===
+            currentUserId
+        ) {
+            return localStream;
+        }
+
+        return (
+            remoteStreams[player.id] ||
+            null
+        );
+    };
+
+    // ==================================================
+    // RENDER
+    // ==================================================
+
     return (
-        <div className="flex h-screen bg-gray-900 text-gray-100">
-            {/* 🎥 Стіл гравців */}
-            <div className="flex-1 flex flex-wrap justify-center items-center gap-6 p-6">
-                {room.players.map((p, i) => (
-                    <div
-                        key={p.id}
-                        className={`w-44 h-44 bg-gray-800 rounded-lg shadow border flex flex-col items-center justify-center relative ${
-                            p.alive ? 'border-green-700' : 'border-red-700 opacity-60'
-                        }`}
-                    >
-                        <div className="absolute top-1 left-1 text-xs text-gray-400">#{i + 1}</div>
-                        <div className="w-32 h-20 bg-gray-700 rounded mb-2 flex items-center justify-center">
-                            <span className="text-gray-400 text-sm">Camera</span>
-                        </div>
-                        <div className="text-sm font-semibold">{p.name}</div>
-                        {isAdmin && (
-                            <div className="absolute top-1 right-1 text-xs bg-red-800 px-1 rounded">
-                                {p.role}
-                            </div>
-                        )}
-                    </div>
-                ))}
-            </div>
+        <div className="flex h-screen overflow-hidden bg-gray-950 text-gray-100">
+            <RoomConnectionBanner
+                connectionPaused={connectionPaused}
+                disconnectedPlayers={
+                    disconnectedPlayers
+                }
+                isAdmin={isAdmin}
+                onDecision={
+                    handleConnectionDecision
+                }
+            />
 
-            {/* 🧭 Сайдбар */}
-            <div className="w-72 bg-gray-800 border-l border-gray-700 p-4 flex flex-col justify-between">
-                <div>
-                    <h2 className="font-bold text-red-400 mb-2">
-                        Room ID: {room.id}
-                        <button
-                            onClick={handleCopyId}
-                            className="ml-2 text-gray-400 hover:text-white"
-                        >
-                            📋
-                        </button>
-                    </h2>
+            <RoomTable
+                players={room.players}
+                adminId={room.adminId}
+                currentUserId={currentUserId}
+                isAdmin={isAdmin}
+                isSmallRoom={isSmallRoom}
+                loadingPlayers={loadingPlayers}
+                getPlayerStream={getPlayerStream}
+                handleMakeAdmin={handleMakeAdmin}
+                transferringAdminId={
+                    transferringAdminId
+                }
+                roomPhase={room.phase}
+            />
 
-                    <h3 className="text-yellow-300">
-                        Поточна фаза: {getCurrentPhase(room)?.name}
-                    </h3>
-
-                    {timer !== null && (
-                        <div className="mt-2">
-                            <span className="text-lg text-green-400">⏱ {timer}s</span>
-                        </div>
-                    )}
-
-                    <p className="mt-4 text-gray-300">
-                        Ви увійшли як: <strong>{playerName}</strong>
-                    </p>
-
-                    <h4 className="mt-4 font-semibold text-red-400">Гравці:</h4>
-                    <ul className="text-sm text-gray-300">
-                        {room.players.map((p, idx) => (
-                            <li key={p.id}>
-                                #{idx + 1} {p.name} {p.alive ? '🙂' : '💀'}
-                            </li>
-                        ))}
-                    </ul>
-                </div>
-
-                {/* 🎮 Кнопки керування */}
-                {isAdmin && (
-                    <div className="flex flex-col gap-2 mt-4">
-                        <button
-                            onClick={() => setIsPaused(p => !p)}
-                            className="bg-gray-700 hover:bg-gray-600 py-1 rounded"
-                        >
-                            {isPaused ? '▶ Продовжити' : '⏸ Пауза'}
-                        </button>
-                        <button
-                            onClick={handleRepeatPhase}
-                            className="bg-yellow-700 hover:bg-yellow-600 py-1 rounded"
-                        >
-                            🔁 Повтор фази
-                        </button>
-                        {room.phase === 'lobby' ? (
-                            <button
-                                onClick={handleStart}
-                                className="bg-green-700 hover:bg-green-600 py-2 rounded font-bold"
-                            >
-                                🚀 Старт гри
-                            </button>
-                        ) : (
-                            <button
-                                onClick={handleNextPhase}
-                                className="bg-purple-700 hover:bg-purple-600 py-2 rounded font-bold"
-                            >
-                                ⏭ Наступна фаза
-                            </button>
-                        )}
-                    </div>
-                )}
-
-                {/* 📹 Камера адміна */}
-                {isAdmin && (
-                    <div className="mt-6 bg-gray-700 rounded-lg p-3 h-32 flex items-center justify-center">
-                        <span className="text-gray-400">Admin Camera</span>
-                    </div>
-                )}
-            </div>
+            <RoomSidebar
+                room={room}
+                playerName={playerName}
+                currentUserId={currentUserId}
+                currentPlayerIsDead={
+                    currentPlayerIsDead
+                }
+                disconnectedPlayerIds={
+                    disconnectedPlayerIds
+                }
+                localStream={localStream}
+                timer={timer}
+                isPaused={isPaused}
+                isAdmin={isAdmin}
+                handleLogout={handleLogout}
+                handleCopyId={handleCopyId}
+                setIsPaused={setIsPaused}
+                handleRepeatPhase={
+                    handleRepeatPhase
+                }
+                handleStart={handleStart}
+                handleNextPhase={
+                    handleNextPhase
+                }
+            />
         </div>
     );
 }
