@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: mafia-server
+    env: node
+    plan: free
+    region: frankfurt
+    rootDir: server
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: CLIENT_ORIGINS
+        sync: false
