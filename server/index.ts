@@ -12,6 +12,7 @@ import {
     SupabaseClient,
     User,
 } from "@supabase/supabase-js";
+import { AccessToken } from "livekit-server-sdk";
 
 // ======================================================
 // ENV
@@ -20,6 +21,11 @@ import {
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY =
     process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const LIVEKIT_API_KEY =
+    process.env.LIVEKIT_API_KEY;
+const LIVEKIT_API_SECRET =
+    process.env.LIVEKIT_API_SECRET;
 
 const PORT =
     Number(process.env.PORT) || 3001;
@@ -33,6 +39,16 @@ if (!SUPABASE_URL) {
 if (!SUPABASE_KEY) {
     throw new Error(
         "SUPABASE_SERVICE_ROLE_KEY is not defined"
+    );
+}
+
+if (
+    !LIVEKIT_API_KEY ||
+    !LIVEKIT_API_SECRET
+) {
+    console.warn(
+        "[LIVEKIT] LIVEKIT_API_KEY / LIVEKIT_API_SECRET is not set — " +
+        "/rooms/:id/livekit-token will fail until these are configured."
     );
 }
 
@@ -75,6 +91,14 @@ app.use(
 );
 
 app.use(express.json());
+
+// Забороняємо браузеру кешувати будь-які API-відповіді —
+// інакше можна побачити застарілий стан кімнати/гри
+// або, як щойно трапилось, застарілу відповідь /health.
+app.use((_req: Request, res: Response, next: NextFunction) => {
+    res.set("Cache-Control", "no-store");
+    next();
+});
 
 // ======================================================
 // SUPABASE
@@ -1274,6 +1298,149 @@ app.post(
 // ======================================================
 // GET PLAYERS
 // ======================================================
+
+// ======================================================
+// LIVEKIT TOKEN
+// ======================================================
+//
+// Видає короткоживучий LiveKit access token лише тому,
+// хто дійсно є учасником (гравцем або admin) цієї room.
+// LiveKit-кімната = наша room.id, тому відео/аудіо ніколи
+// не перетинаються між різними іграми.
+
+app.post(
+    "/rooms/:id/livekit-token",
+    requireAuth,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            if (
+                !LIVEKIT_API_KEY ||
+                !LIVEKIT_API_SECRET
+            ) {
+                return res.status(500).json({
+                    ok: false,
+                    error:
+                        "LiveKit is not configured on the server",
+                });
+            }
+
+            const roomId =
+                req.params.id;
+
+            const userId =
+                req.user!.id;
+
+            const {
+                data: room,
+                error: roomError,
+            } =
+                await supaAdmin
+                    .from("rooms")
+                    .select(
+                        "id, admin_id"
+                    )
+                    .eq(
+                        "id",
+                        roomId
+                    )
+                    .maybeSingle();
+
+            if (roomError) {
+                throw roomError;
+            }
+
+            if (!room) {
+                return res.status(404).json({
+                    ok: false,
+                    error:
+                        "Room not found",
+                });
+            }
+
+            const isAdmin =
+                room.admin_id ===
+                userId;
+
+            let isMember = isAdmin;
+
+            if (!isMember) {
+                const {
+                    data: membership,
+                    error:
+                        membershipError,
+                } =
+                    await supaAdmin
+                        .from(
+                            "players_in_room"
+                        )
+                        .select("id")
+                        .eq(
+                            "room_id",
+                            roomId
+                        )
+                        .eq(
+                            "user_id",
+                            userId
+                        )
+                        .maybeSingle();
+
+                if (membershipError) {
+                    throw membershipError;
+                }
+
+                isMember =
+                    !!membership;
+            }
+
+            if (!isMember) {
+                return res.status(403).json({
+                    ok: false,
+                    error:
+                        "Not a member of this room",
+                });
+            }
+
+            const accessToken =
+                new AccessToken(
+                    LIVEKIT_API_KEY,
+                    LIVEKIT_API_SECRET,
+                    {
+                        identity: userId,
+                    }
+                );
+
+            accessToken.addGrant({
+                room: roomId,
+                roomJoin: true,
+                canPublish: true,
+                canSubscribe: true,
+                canPublishData: true,
+            });
+
+            const token =
+                await accessToken.toJwt();
+
+            return res.json({
+                ok: true,
+                token,
+            });
+        } catch (error) {
+            console.error(
+                "LIVEKIT TOKEN ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                ok: false,
+                error:
+                    "Failed to create LiveKit token",
+            });
+        }
+    }
+);
 
 app.get(
     "/rooms/:id/players",

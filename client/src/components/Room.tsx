@@ -12,6 +12,15 @@ import {
 
 import { io, Socket } from 'socket.io-client';
 
+import {
+    Room as LiveKitRoom,
+    RoomEvent,
+    RemoteParticipant,
+    RemoteTrack,
+    RemoteTrackPublication,
+    Track,
+} from 'livekit-client';
+
 import { RoomState, Player } from '../types';
 
 import { nextPhase } from '../game/phaseManager';
@@ -64,24 +73,12 @@ interface PlayersResponse {
     error?: string;
 }
 
-interface SocketPeer {
-    socketId: string;
-    userId: string;
-}
-
-interface SignalMessage {
-    fromSocketId: string;
-    fromUserId: string;
-    type:
-        | 'offer'
-        | 'answer'
-        | 'ice-candidate';
-    data: any;
-}
-
 const API =
     process.env.REACT_APP_API_URL ||
     'http://localhost:3001';
+
+const LIVEKIT_URL =
+    process.env.REACT_APP_LIVEKIT_URL || '';
 
 export function Room({
                          room: initialRoom,
@@ -105,6 +102,9 @@ export function Room({
     const [localStream, setLocalStream] =
         useState<MediaStream | null>(null);
 
+    const [mediaError, setMediaError] =
+        useState<string | null>(null);
+
     const [
         transferringAdminId,
         setTransferringAdminId,
@@ -127,18 +127,8 @@ export function Room({
     const socketRef =
         useRef<Socket | null>(null);
 
-    const peerConnections =
-        useRef<Map<string, RTCPeerConnection>>(
-            new Map()
-        );
-
-    const peerSockets =
-        useRef<Map<string, string>>(new Map());
-
-    const pendingIceCandidates =
-        useRef<
-            Map<string, RTCIceCandidateInit[]>
-        >(new Map());
+    const livekitRoomRef =
+        useRef<LiveKitRoom | null>(null);
 
     // ==================================================
     // CURRENT USER
@@ -370,299 +360,310 @@ export function Room({
         ]);
 
     // ==================================================
-    // CAMERA
+    // LIVEKIT (camera + mic + remote video/audio)
     // ==================================================
 
     useEffect(() => {
-        let mounted = true;
+        if (!currentUserId) return;
 
-        const startMedia = async () => {
+        let cancelled = false;
+
+        const connectLiveKit = async () => {
             try {
-                const stream =
-                    await navigator.mediaDevices.getUserMedia(
-                        {
-                            video: true,
-                            audio: true,
-                        }
+                const {
+                    data: { session },
+                } =
+                    await supabase.auth.getSession();
+
+                if (
+                    cancelled ||
+                    !session?.access_token
+                ) {
+                    return;
+                }
+
+                const tokenRes = await fetch(
+                    `${API}/rooms/${room.id}/livekit-token`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            Authorization: `Bearer ${session.access_token}`,
+                        },
+                    }
+                );
+
+                const tokenJson =
+                    await tokenRes.json();
+
+                if (
+                    cancelled ||
+                    !tokenJson.ok
+                ) {
+                    console.error(
+                        'LIVEKIT TOKEN ERROR:',
+                        tokenJson.error
                     );
 
-                if (!mounted) {
-                    stream
-                        .getTracks()
-                        .forEach(
-                            (track) =>
-                                track.stop()
-                        );
+                    setMediaError(
+                        'Не вдалося підключитись до відео-сервера. Онови сторінку.'
+                    );
 
                     return;
                 }
 
-                localStreamRef.current =
-                    stream;
+                const lkRoom =
+                    new LiveKitRoom();
 
-                setLocalStream(stream);
+                livekitRoomRef.current =
+                    lkRoom;
+
+                const upsertRemoteTrack = (
+                    participant: RemoteParticipant,
+                    track: RemoteTrack
+                ) => {
+                    setRemoteStreams(
+                        (current) => {
+                            const existing =
+                                current[
+                                    participant
+                                        .identity
+                                    ] ||
+                                new MediaStream();
+
+                            existing.addTrack(
+                                track.mediaStreamTrack
+                            );
+
+                            return {
+                                ...current,
+                                [participant.identity]:
+                                existing,
+                            };
+                        }
+                    );
+                };
+
+                const removeRemoteTrack = (
+                    participant: RemoteParticipant,
+                    track: RemoteTrack
+                ) => {
+                    setRemoteStreams(
+                        (current) => {
+                            const existing =
+                                current[
+                                    participant
+                                        .identity
+                                    ];
+
+                            if (!existing) {
+                                return current;
+                            }
+
+                            existing.removeTrack(
+                                track.mediaStreamTrack
+                            );
+
+                            return {
+                                ...current,
+                            };
+                        }
+                    );
+                };
+
+                lkRoom.on(
+                    RoomEvent.TrackSubscribed,
+                    (
+                        track,
+                        _publication: RemoteTrackPublication,
+                        participant
+                    ) =>
+                        upsertRemoteTrack(
+                            participant,
+                            track
+                        )
+                );
+
+                lkRoom.on(
+                    RoomEvent.TrackUnsubscribed,
+                    (
+                        track,
+                        _publication: RemoteTrackPublication,
+                        participant
+                    ) =>
+                        removeRemoteTrack(
+                            participant,
+                            track
+                        )
+                );
+
+                lkRoom.on(
+                    RoomEvent.ParticipantDisconnected,
+                    (participant) => {
+                        setRemoteStreams(
+                            (current) => {
+                                const next = {
+                                    ...current,
+                                };
+
+                                delete next[
+                                    participant
+                                        .identity
+                                    ];
+
+                                return next;
+                            }
+                        );
+                    }
+                );
+
+                await lkRoom.connect(
+                    LIVEKIT_URL,
+                    tokenJson.token
+                );
+
+                if (cancelled) {
+                    lkRoom.disconnect();
+
+                    return;
+                }
+
+                try {
+                    await lkRoom.localParticipant.setCameraEnabled(
+                        true
+                    );
+
+                    await lkRoom.localParticipant.setMicrophoneEnabled(
+                        true
+                    );
+
+                    const videoTrack =
+                        lkRoom.localParticipant
+                            .getTrackPublication(
+                                Track.Source
+                                    .Camera
+                            )
+                            ?.track
+                            ?.mediaStreamTrack;
+
+                    const audioTrack =
+                        lkRoom.localParticipant
+                            .getTrackPublication(
+                                Track.Source
+                                    .Microphone
+                            )
+                            ?.track
+                            ?.mediaStreamTrack;
+
+                    const tracks = [
+                        videoTrack,
+                        audioTrack,
+                    ].filter(
+                        (
+                            t
+                        ): t is MediaStreamTrack =>
+                            !!t
+                    );
+
+                    const stream =
+                        new MediaStream(
+                            tracks
+                        );
+
+                    localStreamRef.current =
+                        stream;
+
+                    setLocalStream(stream);
+                    setMediaError(null);
+                } catch (error) {
+                    console.error(
+                        'MEDIA ERROR:',
+                        error
+                    );
+
+                    const name =
+                        error instanceof
+                        DOMException
+                            ? error.name
+                            : '';
+
+                    const friendlyMessage =
+                        name ===
+                        'NotAllowedError'
+                            ? 'Доступ до камери/мікрофона заборонено в браузері. Дозволь доступ і онови сторінку.'
+                            : name ===
+                            'NotFoundError'
+                                ? 'Камеру або мікрофон не знайдено. Перевір, чи підключений пристрій.'
+                                : name ===
+                                'NotReadableError' ||
+                                (error instanceof
+                                    DOMException &&
+                                    /starting videoinput failed/i.test(
+                                        error.message ||
+                                        ''
+                                    ))
+                                    ? 'Камера вже використовується іншою програмою (Zoom, Teams, інша вкладка). Закрий її і онови сторінку.'
+                                    : 'Не вдалося підключити камеру/мікрофон. Онови сторінку або перевір налаштування пристрою.';
+
+                    setMediaError(
+                        friendlyMessage
+                    );
+                }
             } catch (error) {
                 console.error(
-                    'MEDIA ERROR:',
+                    'LIVEKIT CONNECT ERROR:',
                     error
+                );
+
+                setMediaError(
+                    'Не вдалося підключитись до відео-сервера. Онови сторінку.'
                 );
             }
         };
 
-        startMedia();
+        connectLiveKit();
 
         return () => {
-            mounted = false;
+            cancelled = true;
 
-            localStreamRef.current
-                ?.getTracks()
-                .forEach(
-                    (track) =>
-                        track.stop()
-                );
+            livekitRoomRef.current?.disconnect();
+
+            livekitRoomRef.current = null;
 
             localStreamRef.current = null;
+
+            setLocalStream(null);
+
+            setRemoteStreams({});
         };
-    }, []);
+    }, [
+        currentUserId,
+        room.id,
+    ]);
 
     // ==================================================
     // DEAD => MIC OFF
     // ==================================================
 
     useEffect(() => {
-        if (!localStream) return;
-
-        localStream
-            .getAudioTracks()
-            .forEach((track) => {
-                track.enabled =
-                    !currentPlayerIsDead;
-            });
-    }, [
-        localStream,
-        currentPlayerIsDead,
-    ]);
-
-    // ==================================================
-    // WEBRTC HELPERS
-    // ==================================================
-
-    const closePeer = useCallback(
-        (userId: string) => {
-            const pc =
-                peerConnections.current.get(
-                    userId
-                );
-
-            if (pc) {
-                pc.ontrack = null;
-                pc.onicecandidate = null;
-                pc.onconnectionstatechange =
-                    null;
-
-                pc.close();
-            }
-
-            peerConnections.current.delete(
-                userId
-            );
-
-            peerSockets.current.delete(
-                userId
-            );
-
-            pendingIceCandidates.current.delete(
-                userId
-            );
-
-            setRemoteStreams(
-                (current) => {
-                    const next = {
-                        ...current,
-                    };
-
-                    delete next[userId];
-
-                    return next;
-                }
-            );
-        },
-        []
-    );
-
-    const createPeerConnection =
-        useCallback(
-            (
-                peerUserId: string,
-                peerSocketId: string
-            ) => {
-                const existing =
-                    peerConnections.current.get(
-                        peerUserId
-                    );
-
-                if (existing) {
-                    peerSockets.current.set(
-                        peerUserId,
-                        peerSocketId
-                    );
-
-                    return existing;
-                }
-
-                console.log(
-                    '[WEBRTC] creating peer connection:',
-                    peerUserId
-                );
-
-                const pc =
-                    new RTCPeerConnection({
-                        iceServers: [
-                            {
-                                urls:
-                                    'stun:stun.l.google.com:19302',
-                            },
-                        ],
-                    });
-
-                peerConnections.current.set(
-                    peerUserId,
-                    pc
-                );
-
-                peerSockets.current.set(
-                    peerUserId,
-                    peerSocketId
-                );
-
-                if (
-                    localStreamRef.current
-                ) {
-                    localStreamRef.current
-                        .getTracks()
-                        .forEach((track) => {
-                            pc.addTrack(
-                                track,
-                                localStreamRef.current!
-                            );
-                        });
-                }
-
-                pc.onicecandidate = (
-                    event
-                ) => {
-                    if (
-                        !event.candidate
-                    ) {
-                        return;
-                    }
-
-                    socketRef.current?.emit(
-                        'webrtc-signal',
-                        {
-                            to: peerSocketId,
-                            type: 'ice-candidate',
-                            data: event.candidate.toJSON(),
-                        }
-                    );
-                };
-
-                pc.ontrack = (event) => {
-                    const stream =
-                        event.streams[0];
-
-                    if (!stream) {
-                        return;
-                    }
-
-                    console.log(
-                        '[WEBRTC] remote stream received:',
-                        peerUserId
-                    );
-
-                    setRemoteStreams(
-                        (current) => ({
-                            ...current,
-                            [peerUserId]:
-                            stream,
-                        })
-                    );
-                };
-
-                pc.onconnectionstatechange =
-                    () => {
-                        console.log(
-                            '[WEBRTC]',
-                            peerUserId,
-                            'connection:',
-                            pc.connectionState
-                        );
-
-                        if (
-                            pc.connectionState ===
-                            'failed' ||
-                            pc.connectionState ===
-                            'closed' ||
-                            pc.connectionState ===
-                            'disconnected'
-                        ) {
-                            closePeer(
-                                peerUserId
-                            );
-                        }
-                    };
-
-                return pc;
-            },
-            [closePeer]
-        );
-
-    const createOffer = useCallback(
-        async (
-            peerUserId: string,
-            peerSocketId: string
-        ) => {
-            const pc =
-                createPeerConnection(
-                    peerUserId,
-                    peerSocketId
-                );
-
-            try {
-                const offer =
-                    await pc.createOffer();
-
-                await pc.setLocalDescription(
-                    offer
-                );
-
-                socketRef.current?.emit(
-                    'webrtc-signal',
-                    {
-                        to: peerSocketId,
-                        type: 'offer',
-                        data: offer,
-                    }
-                );
-            } catch (error) {
+        livekitRoomRef.current?.localParticipant
+            .setMicrophoneEnabled(
+                !currentPlayerIsDead
+            )
+            .catch((error) =>
                 console.error(
-                    'CREATE OFFER ERROR:',
+                    'MIC TOGGLE ERROR:',
                     error
-                );
-            }
-        },
-        [createPeerConnection]
-    );
+                )
+            );
+    }, [currentPlayerIsDead]);
 
     // ==================================================
-    // SOCKET.IO + WEBRTC
+    // SOCKET.IO (room / game events)
     // ==================================================
 
     useEffect(() => {
-        if (
-            !currentUserId ||
-            !localStream
-        ) {
+
+        if (!currentUserId) {
             return;
         }
 
@@ -715,318 +716,9 @@ export function Room({
                         message: string
                     ) => {
                         console.error(
-                            '[WEBRTC] room error:',
+                            '[ROOM] room error:',
                             message
                         );
-                    }
-                );
-
-                socket.on(
-                    'room-peers',
-                    async (
-                        peers: SocketPeer[]
-                    ) => {
-                        for (
-                            const peer of peers
-                            ) {
-                            if (
-                                peer.userId ===
-                                currentUserId
-                            ) {
-                                continue;
-                            }
-
-                            peerSockets.current.set(
-                                peer.userId,
-                                peer.socketId
-                            );
-
-                            createPeerConnection(
-                                peer.userId,
-                                peer.socketId
-                            );
-
-                            if (
-                                currentUserId <
-                                peer.userId
-                            ) {
-                                await createOffer(
-                                    peer.userId,
-                                    peer.socketId
-                                );
-                            }
-                        }
-                    }
-                );
-
-                socket.on(
-                    'peer-joined',
-                    async (
-                        peer: SocketPeer
-                    ) => {
-                        if (
-                            peer.userId ===
-                            currentUserId
-                        ) {
-                            return;
-                        }
-
-                        peerSockets.current.set(
-                            peer.userId,
-                            peer.socketId
-                        );
-
-                        createPeerConnection(
-                            peer.userId,
-                            peer.socketId
-                        );
-
-                        if (
-                            currentUserId <
-                            peer.userId
-                        ) {
-                            await createOffer(
-                                peer.userId,
-                                peer.socketId
-                            );
-                        }
-                    }
-                );
-
-                socket.on(
-                    'webrtc-signal',
-                    async (
-                        signal: SignalMessage
-                    ) => {
-                        const {
-                            fromUserId,
-                            fromSocketId,
-                            type,
-                            data,
-                        } = signal;
-
-                        if (
-                            fromUserId ===
-                            currentUserId
-                        ) {
-                            return;
-                        }
-
-                        console.log(
-                            '[WEBRTC] signal:',
-                            type,
-                            'from:',
-                            fromUserId
-                        );
-
-                        peerSockets.current.set(
-                            fromUserId,
-                            fromSocketId
-                        );
-
-                        if (
-                            type ===
-                            'offer'
-                        ) {
-                            const pc =
-                                createPeerConnection(
-                                    fromUserId,
-                                    fromSocketId
-                                );
-
-                            try {
-                                await pc.setRemoteDescription(
-                                    new RTCSessionDescription(
-                                        data
-                                    )
-                                );
-
-                                const queued =
-                                    pendingIceCandidates.current.get(
-                                        fromUserId
-                                    ) || [];
-
-                                for (
-                                    const candidate of queued
-                                    ) {
-                                    try {
-                                        await pc.addIceCandidate(
-                                            new RTCIceCandidate(
-                                                candidate
-                                            )
-                                        );
-                                    } catch (
-                                        error
-                                        ) {
-                                        console.error(
-                                            '[WEBRTC] queued ICE error:',
-                                            error
-                                        );
-                                    }
-                                }
-
-                                pendingIceCandidates.current.delete(
-                                    fromUserId
-                                );
-
-                                const answer =
-                                    await pc.createAnswer();
-
-                                await pc.setLocalDescription(
-                                    answer
-                                );
-
-                                socket.emit(
-                                    'webrtc-signal',
-                                    {
-                                        to: fromSocketId,
-                                        type: 'answer',
-                                        data: answer,
-                                    }
-                                );
-                            } catch (
-                                error
-                                ) {
-                                console.error(
-                                    '[WEBRTC] HANDLE OFFER ERROR:',
-                                    error
-                                );
-                            }
-
-                            return;
-                        }
-
-                        if (
-                            type ===
-                            'answer'
-                        ) {
-                            const pc =
-                                peerConnections.current.get(
-                                    fromUserId
-                                );
-
-                            if (!pc) {
-                                console.warn(
-                                    '[WEBRTC] answer received but PC missing:',
-                                    fromUserId
-                                );
-
-                                return;
-                            }
-
-                            try {
-                                await pc.setRemoteDescription(
-                                    new RTCSessionDescription(
-                                        data
-                                    )
-                                );
-
-                                const queued =
-                                    pendingIceCandidates.current.get(
-                                        fromUserId
-                                    ) || [];
-
-                                for (
-                                    const candidate of queued
-                                    ) {
-                                    try {
-                                        await pc.addIceCandidate(
-                                            new RTCIceCandidate(
-                                                candidate
-                                            )
-                                        );
-                                    } catch (
-                                        error
-                                        ) {
-                                        console.error(
-                                            '[WEBRTC] queued ICE error:',
-                                            error
-                                        );
-                                    }
-                                }
-
-                                pendingIceCandidates.current.delete(
-                                    fromUserId
-                                );
-                            } catch (
-                                error
-                                ) {
-                                console.error(
-                                    '[WEBRTC] HANDLE ANSWER ERROR:',
-                                    error
-                                );
-                            }
-
-                            return;
-                        }
-
-                        if (
-                            type ===
-                            'ice-candidate'
-                        ) {
-                            const pc =
-                                peerConnections.current.get(
-                                    fromUserId
-                                );
-
-                            if (!pc) {
-                                console.warn(
-                                    '[WEBRTC] ICE received but PC missing:',
-                                    fromUserId
-                                );
-
-                                return;
-                            }
-
-                            const candidate =
-                                data as RTCIceCandidateInit;
-
-                            if (
-                                !pc.remoteDescription
-                            ) {
-                                const queue =
-                                    pendingIceCandidates.current.get(
-                                        fromUserId
-                                    ) || [];
-
-                                queue.push(
-                                    candidate
-                                );
-
-                                pendingIceCandidates.current.set(
-                                    fromUserId,
-                                    queue
-                                );
-
-                                return;
-                            }
-
-                            try {
-                                await pc.addIceCandidate(
-                                    new RTCIceCandidate(
-                                        candidate
-                                    )
-                                );
-                            } catch (
-                                error
-                                ) {
-                                console.error(
-                                    '[WEBRTC] ICE ERROR:',
-                                    error
-                                );
-                            }
-                        }
-                    }
-                );
-
-                socket.on(
-                    'peer-left',
-                    ({
-                         userId,
-                     }: {
-                        userId: string;
-                    }) => {
-                        closePeer(userId);
                     }
                 );
 
@@ -1064,8 +756,6 @@ export function Room({
                         );
 
                         setIsPaused(true);
-
-                        closePeer(userId);
                     }
                 );
 
@@ -1173,26 +863,10 @@ export function Room({
             }
 
             socketRef.current = null;
-
-            peerConnections.current.forEach(
-                (pc) => pc.close()
-            );
-
-            peerConnections.current.clear();
-
-            peerSockets.current.clear();
-
-            pendingIceCandidates.current.clear();
-
-            setRemoteStreams({});
         };
     }, [
         currentUserId,
-        localStream,
         room.id,
-        createPeerConnection,
-        createOffer,
-        closePeer,
     ]);
 
     // ==================================================
@@ -1579,15 +1253,9 @@ export function Room({
 
             socketRef.current = null;
 
-            peerConnections.current.forEach(
-                (pc) => pc.close()
-            );
+            livekitRoomRef.current?.disconnect();
 
-            peerConnections.current.clear();
-
-            peerSockets.current.clear();
-
-            pendingIceCandidates.current.clear();
+            livekitRoomRef.current = null;
 
             localStreamRef.current
                 ?.getTracks()
@@ -1725,6 +1393,7 @@ export function Room({
                     disconnectedPlayerIds
                 }
                 localStream={localStream}
+                mediaError={mediaError}
                 timer={timer}
                 isPaused={isPaused}
                 isAdmin={isAdmin}
