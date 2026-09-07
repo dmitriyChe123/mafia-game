@@ -11,6 +11,7 @@ interface RoomSidebarProps {
     currentPlayerIsDead: boolean;
     disconnectedPlayerIds: string[];
     localStream: MediaStream | null;
+    mediaError: string | null;
     timer: number | null;
     isPaused: boolean;
     isAdmin: boolean;
@@ -31,6 +32,7 @@ export function RoomSidebar({
                                 currentPlayerIsDead,
                                 disconnectedPlayerIds,
                                 localStream,
+                                mediaError,
                                 timer,
                                 isPaused,
                                 isAdmin,
@@ -158,6 +160,7 @@ export function RoomSidebar({
 
             <LocalCamera
                 localStream={localStream}
+                mediaError={mediaError}
                 currentPlayerIsDead={
                     currentPlayerIsDead
                 }

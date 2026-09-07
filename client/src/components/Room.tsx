@@ -105,6 +105,9 @@ export function Room({
     const [localStream, setLocalStream] =
         useState<MediaStream | null>(null);
 
+    const [mediaError, setMediaError] =
+        useState<string | null>(null);
+
     const [
         transferringAdminId,
         setTransferringAdminId,
@@ -401,11 +404,32 @@ export function Room({
                     stream;
 
                 setLocalStream(stream);
+                setMediaError(null);
             } catch (error) {
                 console.error(
                     'MEDIA ERROR:',
                     error
                 );
+
+                const name =
+                    error instanceof DOMException
+                        ? error.name
+                        : '';
+
+                const friendlyMessage =
+                    name === 'NotAllowedError'
+                        ? 'Доступ до камери/мікрофона заборонено в браузері. Дозволь доступ і онови сторінку.'
+                        : name === 'NotFoundError'
+                            ? 'Камеру або мікрофон не знайдено. Перевір, чи підключений пристрій.'
+                            : name === 'NotReadableError' ||
+                            (error instanceof DOMException &&
+                                /starting videoinput failed/i.test(
+                                    error.message || ''
+                                ))
+                                ? 'Камера вже використовується іншою програмою (Zoom, Teams, інша вкладка). Закрий її і онови сторінку.'
+                                : 'Не вдалося підключити камеру/мікрофон. Онови сторінку або перевір налаштування пристрою.';
+
+                setMediaError(friendlyMessage);
             }
         };
 
@@ -1725,6 +1749,7 @@ export function Room({
                     disconnectedPlayerIds
                 }
                 localStream={localStream}
+                mediaError={mediaError}
                 timer={timer}
                 isPaused={isPaused}
                 isAdmin={isAdmin}

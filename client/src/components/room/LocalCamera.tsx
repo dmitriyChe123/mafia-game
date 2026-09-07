@@ -1,10 +1,12 @@
 interface LocalCameraProps {
     localStream: MediaStream | null;
+    mediaError: string | null;
     currentPlayerIsDead: boolean;
 }
 
 export function LocalCamera({
                                 localStream,
+                                mediaError,
                                 currentPlayerIsDead,
                             }: LocalCameraProps) {
     return (
@@ -44,6 +46,16 @@ export function LocalCamera({
                         playsInline
                         className="h-full w-full object-cover"
                     />
+                ) : mediaError ? (
+                    <div className="flex h-full flex-col items-center justify-center gap-1 px-3 text-center">
+                        <div className="text-2xl">
+                            ⚠️
+                        </div>
+
+                        <div className="text-xs text-red-400">
+                            {mediaError}
+                        </div>
+                    </div>
                 ) : (
                     <div className="flex h-full items-center justify-center text-sm text-gray-600">
                         Підключення камери...
@@ -62,7 +74,9 @@ export function LocalCamera({
 
                 {localStream
                     ? 'Камера підключена'
-                    : 'Камера не підключена'}
+                    : mediaError
+                        ? 'Камера недоступна'
+                        : 'Камера не підключена'}
             </div>
         </div>
     );
