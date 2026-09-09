@@ -27,7 +27,6 @@ import { nextPhase } from '../game/phaseManager';
 
 import { GAME_PHASES } from '../game/phases';
 
-import { assignRolesToPlayers } from '../game/roleAssigner';
 
 import { supabase } from '../supabase';
 
@@ -1014,16 +1013,12 @@ export function Room({
                 );
             }
 
-            const playersWithRoles =
-                assignRolesToPlayers(
-                    room.players
-                );
-
+            // Ролі вже призначені на backend і
+            // прийдуть при наступному опитуванні
+            // loadPlayers() (кожні 2с) — кожен побачить
+            // лише свою власну роль.
             setRoom({
                 ...room,
-
-                players:
-                playersWithRoles,
 
                 phase: 'night',
 
