@@ -137,7 +137,8 @@ export function VideoTile({
                     </div>
                 ) : null}
 
-                {isAdmin && player.role ? (
+                {(isMe || isAdmin) &&
+                player.role ? (
                     <div className="text-[10px] text-yellow-400">
                         {player.role}
                     </div>

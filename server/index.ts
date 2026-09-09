@@ -13,6 +13,7 @@ import {
     User,
 } from "@supabase/supabase-js";
 import { AccessToken } from "livekit-server-sdk";
+import { assignRoles } from "./game/roles";
 
 // ======================================================
 // ENV
@@ -791,6 +792,55 @@ app.post(
                 });
             }
 
+            // ==========================================
+            // АВТОРИТАТИВНА РОЗДАЧА РОЛЕЙ (backend-only)
+            //
+            // Ролі ніколи не обчислюються на frontend і
+            // не потрапляють у спільний game-state —
+            // кожен гравець отримує лише свою роль через
+            // приватну socket-подію "your-role".
+            // ==========================================
+
+            const roles = assignRoles(
+                players.length
+            );
+
+            const shuffledPlayers = [
+                ...players,
+            ].sort(
+                () => Math.random() - 0.5
+            );
+
+            const assignments =
+                shuffledPlayers.map(
+                    (player, index) => ({
+                        userId:
+                        player.user_id,
+                        role: roles[index],
+                    })
+                );
+
+            await Promise.all(
+                assignments.map(
+                    ({ userId, role }) =>
+                        supaAdmin
+                            .from(
+                                "players_in_room"
+                            )
+                            .update({
+                                role,
+                            })
+                            .eq(
+                                "room_id",
+                                roomId
+                            )
+                            .eq(
+                                "user_id",
+                                userId
+                            )
+                )
+            );
+
             const {
                 data:
                     updatedRoom,
@@ -845,6 +895,17 @@ app.post(
 
             io.to(roomId).emit(
                 "game-started"
+            );
+
+            assignments.forEach(
+                ({ userId, role }) => {
+                    io.to(
+                        `user:${userId}`
+                    ).emit(
+                        "your-role",
+                        { role }
+                    );
+                }
             );
 
             return res.json({
@@ -1453,6 +1514,9 @@ app.get(
             const roomId =
                 req.params.id;
 
+            const requesterId =
+                req.user!.id;
+
             const {
                 data: room,
                 error: roomError,
@@ -1477,6 +1541,54 @@ app.get(
                     ok: false,
                     error:
                         "Room not found",
+                });
+            }
+
+            // ==========================================
+            // Тільки учасник цієї room (гравець або
+            // admin) може бачити її ростер.
+            // ==========================================
+
+            const isAdmin =
+                room.admin_id ===
+                requesterId;
+
+            let isMember = isAdmin;
+
+            if (!isMember) {
+                const {
+                    data: membership,
+                    error:
+                        membershipError,
+                } =
+                    await supaAdmin
+                        .from(
+                            "players_in_room"
+                        )
+                        .select("id")
+                        .eq(
+                            "room_id",
+                            roomId
+                        )
+                        .eq(
+                            "user_id",
+                            requesterId
+                        )
+                        .maybeSingle();
+
+                if (membershipError) {
+                    throw membershipError;
+                }
+
+                isMember =
+                    !!membership;
+            }
+
+            if (!isMember) {
+                return res.status(403).json({
+                    ok: false,
+                    error:
+                        "Not a member of this room",
                 });
             }
 
@@ -1579,6 +1691,17 @@ app.get(
                 (players || []).map(
                     (player) => ({
                         ...player,
+
+                        // Роль показуємо самому
+                        // гравцю або admin room —
+                        // усім іншим null, навіть якщо
+                        // роль вже призначена в БД.
+                        role:
+                            player.user_id ===
+                            requesterId ||
+                            isAdmin
+                                ? player.role
+                                : null,
 
                         users:
                             usersMap.get(
@@ -1730,6 +1853,18 @@ interface ServerToClientEvents {
     ) => void;
 
     "game-started": () => void;
+
+    "your-role": (
+        data: {
+            role:
+                | "mafia"
+                | "boss"
+                | "detective"
+                | "doctor"
+                | "lover"
+                | "civilian";
+        }
+    ) => void;
 }
 
 // ======================================================
@@ -1994,6 +2129,15 @@ io.on(
 
                     socket.join(
                         roomId
+                    );
+
+                    // Персональна кімната — щоб мати
+                    // змогу приватно надіслати цьому
+                    // юзеру подію на кшталт "your-role",
+                    // незалежно від того, скільки в нього
+                    // відкрито вкладок/сокетів.
+                    socket.join(
+                        `user:${userId}`
                     );
 
                     socket.emit(
