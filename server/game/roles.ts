@@ -1,3 +1,5 @@
+import { RoomSize } from './roomSize';
+
 export type Role =
     | 'mafia'
     | 'boss'
@@ -15,15 +17,19 @@ export type Role =
  *                        1 Doctor, 1 Lover, 5 Civilian
  *
  * Для тестових кімнат з меншою кількістю гравців (поки
- * немає повного matchmaking на 8/11) склад пропорційно
- * спрощується, зберігаючи дух ТЗ: спочатку з'являється
- * мафія, потім detective/doctor/lover по мірі зростання
- * кількості гравців, решта — цивільні.
+ * не всі 8/11 зібрались) склад пропорційно спрощується,
+ * зберігаючи дух ТЗ: спочатку з'являється мафія, потім
+ * detective/doctor/lover по мірі зростання кількості
+ * гравців, решта — цивільні.
  */
 export function assignRoles(
-    playerCount: number
+    playerCount: number,
+    roomSize: RoomSize = 'small'
 ): Role[] {
-    if (playerCount >= 11) {
+    if (
+        roomSize === 'large' &&
+        playerCount >= 11
+    ) {
         const roles: Role[] = [
             'boss',
             'mafia',

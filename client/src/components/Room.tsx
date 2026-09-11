@@ -23,7 +23,6 @@ import {
 
 import { RoomState, Player } from '../types';
 
-import { nextPhase } from '../game/phaseManager';
 
 import { GAME_PHASES } from '../game/phases';
 
@@ -103,6 +102,25 @@ export function Room({
 
     const [mediaError, setMediaError] =
         useState<string | null>(null);
+
+    const [voteTally, setVoteTally] =
+        useState<Record<string, number>>(
+            {}
+        );
+
+    const [
+        nightActionResult,
+        setNightActionResult,
+    ] = useState<{
+        type: string;
+        targetUserId: string;
+        result: boolean;
+    } | null>(null);
+
+    const [winner, setWinner] =
+        useState<
+            'mafia' | 'civilians' | null
+        >(null);
 
     const [
         transferringAdminId,
@@ -847,6 +865,162 @@ export function Room({
                         );
                     }
                 );
+
+                socket.on(
+                    'phase-changed',
+                    (data: {
+                        phase: string;
+                        phaseIndex: number;
+                        phaseStartedAt: string;
+                        phaseEndsAt:
+                            string | null;
+                    }) => {
+                        setRoom(
+                            (current) => ({
+                                ...current,
+                                phase: data.phase as any,
+                                currentPhaseIndex:
+                                data.phaseIndex,
+                            })
+                        );
+
+                        if (
+                            data.phaseEndsAt
+                        ) {
+                            const remaining =
+                                Math.max(
+                                    0,
+                                    Math.round(
+                                        (new Date(
+                                            data.phaseEndsAt
+                                        ).getTime() -
+                                            Date.now()) /
+                                        1000
+                                    )
+                                );
+
+                            setTimer(
+                                remaining
+                            );
+                        } else {
+                            setTimer(null);
+                        }
+
+                        setIsPaused(false);
+                    }
+                );
+
+                socket.on(
+                    'player-died',
+                    (data: {
+                        userId: string;
+                        role:
+                            string | null;
+                    }) => {
+                        setRoom(
+                            (current) => ({
+                                ...current,
+                                players:
+                                current.players.map(
+                                    (p) =>
+                                        p.id ===
+                                        data.userId
+                                            ? {
+                                                ...p,
+                                                alive: false,
+                                                role:
+                                                    (data.role as any) ||
+                                                    p.role,
+                                            }
+                                            : p
+                                ),
+                            })
+                        );
+                    }
+                );
+
+                socket.on(
+                    'voting-finished',
+                    (data: {
+                        eliminatedUserId:
+                            string | null;
+                        role:
+                            string | null;
+                    }) => {
+                        if (
+                            !data.eliminatedUserId
+                        ) {
+                            return;
+                        }
+
+                        setRoom(
+                            (current) => ({
+                                ...current,
+                                players:
+                                current.players.map(
+                                    (p) =>
+                                        p.id ===
+                                        data.eliminatedUserId
+                                            ? {
+                                                ...p,
+                                                alive: false,
+                                                role:
+                                                    (data.role as any) ||
+                                                    p.role,
+                                            }
+                                            : p
+                                ),
+                            })
+                        );
+                    }
+                );
+
+                socket.on(
+                    'vote-updated',
+                    (data: {
+                        tally: Record<
+                            string,
+                            number
+                        >;
+                    }) => {
+                        setVoteTally(
+                            data.tally
+                        );
+                    }
+                );
+
+                socket.on(
+                    'night-action-result',
+                    (data: {
+                        type: string;
+                        targetUserId: string;
+                        result: boolean;
+                    }) => {
+                        setNightActionResult(
+                            data
+                        );
+                    }
+                );
+
+                socket.on(
+                    'game-over',
+                    (data: {
+                        winner:
+                            | 'mafia'
+                            | 'civilians';
+                    }) => {
+                        setWinner(
+                            data.winner
+                        );
+
+                        setRoom(
+                            (current) => ({
+                                ...current,
+                                phase: 'end',
+                            })
+                        );
+                    }
+                );
             };
 
         connectSocket();
@@ -896,20 +1070,161 @@ export function Room({
     // ==================================================
 
     const handleNextPhase =
-        useCallback(() => {
+        useCallback(async () => {
             if (!isAdmin) return;
 
-            const updated =
-                nextPhase(room);
+            try {
+                const {
+                    data: { session },
+                } =
+                    await supabase.auth.getSession();
 
-            setRoom(updated);
+                await fetch(
+                    `${API}/rooms/${room.id}/next-phase`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            Authorization: `Bearer ${session?.access_token}`,
+                        },
+                    }
+                );
+            } catch (error) {
+                console.error(
+                    'NEXT PHASE ERROR:',
+                    error
+                );
+            }
         }, [
             isAdmin,
-            room,
+            room.id,
         ]);
 
     // ==================================================
-    // TIMER
+    // NIGHT ACTION / VOTE (backend-authoritative)
+    // ==================================================
+
+    const submitNightAction =
+        useCallback(
+            async (
+                type:
+                    | 'mafia_kill'
+                    | 'detective_inspect'
+                    | 'doctor_heal'
+                    | 'lover_action',
+                targetUserId: string
+            ) => {
+                try {
+                    const {
+                        data: { session },
+                    } =
+                        await supabase.auth.getSession();
+
+                    const res =
+                        await fetch(
+                            `${API}/rooms/${room.id}/night-action`,
+                            {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type':
+                                        'application/json',
+                                    Authorization: `Bearer ${session?.access_token}`,
+                                },
+                                body: JSON.stringify(
+                                    {
+                                        type,
+                                        targetUserId,
+                                    }
+                                ),
+                            }
+                        );
+
+                    const json =
+                        await res.json();
+
+                    if (!json.ok) {
+                        console.error(
+                            'NIGHT ACTION REJECTED:',
+                            json.error
+                        );
+                    }
+
+                    return json;
+                } catch (error) {
+                    console.error(
+                        'NIGHT ACTION ERROR:',
+                        error
+                    );
+
+                    return {
+                        ok: false,
+                    };
+                }
+            },
+            [room.id]
+        );
+
+    const submitVote =
+        useCallback(
+            async (
+                targetUserId:
+                    string | 'skip'
+            ) => {
+                try {
+                    const {
+                        data: { session },
+                    } =
+                        await supabase.auth.getSession();
+
+                    const res =
+                        await fetch(
+                            `${API}/rooms/${room.id}/vote`,
+                            {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type':
+                                        'application/json',
+                                    Authorization: `Bearer ${session?.access_token}`,
+                                },
+                                body: JSON.stringify(
+                                    {
+                                        targetUserId:
+                                        targetUserId ===
+                                        'skip'
+                                            ? undefined
+                                            : targetUserId,
+                                    }
+                                ),
+                            }
+                        );
+
+                    const json =
+                        await res.json();
+
+                    if (!json.ok) {
+                        console.error(
+                            'VOTE REJECTED:',
+                            json.error
+                        );
+                    }
+
+                    return json;
+                } catch (error) {
+                    console.error(
+                        'VOTE ERROR:',
+                        error
+                    );
+
+                    return {
+                        ok: false,
+                    };
+                }
+            },
+            [room.id]
+        );
+
+    // ==================================================
+    // TIMER (візуальний зворотній відлік; авторитетне
+    // джерело — "phase-changed" з backend, див. нижче)
     // ==================================================
 
     useEffect(() => {
@@ -931,10 +1246,6 @@ export function Room({
                             interval
                         );
 
-                        if (isAdmin) {
-                            handleNextPhase();
-                        }
-
                         return 0;
                     }
 
@@ -949,8 +1260,6 @@ export function Room({
     }, [
         timer,
         isPaused,
-        isAdmin,
-        handleNextPhase,
     ]);
 
     // ==================================================
@@ -1381,6 +1690,7 @@ export function Room({
                 room={room}
                 playerName={playerName}
                 currentUserId={currentUserId}
+                myRole={currentPlayer?.role}
                 currentPlayerIsDead={
                     currentPlayerIsDead
                 }
@@ -1392,6 +1702,15 @@ export function Room({
                 timer={timer}
                 isPaused={isPaused}
                 isAdmin={isAdmin}
+                voteTally={voteTally}
+                nightActionResult={
+                    nightActionResult
+                }
+                winner={winner}
+                onNightAction={
+                    submitNightAction
+                }
+                onVote={submitVote}
                 handleLogout={handleLogout}
                 handleCopyId={handleCopyId}
                 setIsPaused={setIsPaused}
