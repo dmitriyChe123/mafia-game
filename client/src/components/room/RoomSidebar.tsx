@@ -1,13 +1,15 @@
-import { Player, RoomState } from '../../types';
+import { Player, Role, RoomState } from '../../types';
 import { getCurrentPhase } from '../../game/phaseManager';
 import { AdminControls } from './AdminControls';
 import { LocalCamera } from './LocalCamera';
 import { PlayerList } from './PlayerList';
+import { ActionPanel } from './ActionPanel';
 
 interface RoomSidebarProps {
     room: RoomState;
     playerName: string;
     currentUserId: string | null;
+    myRole: Role | undefined;
     currentPlayerIsDead: boolean;
     disconnectedPlayerIds: string[];
     localStream: MediaStream | null;
@@ -15,6 +17,24 @@ interface RoomSidebarProps {
     timer: number | null;
     isPaused: boolean;
     isAdmin: boolean;
+    voteTally: Record<string, number>;
+    nightActionResult: {
+        type: string;
+        targetUserId: string;
+        result: boolean;
+    } | null;
+    winner: 'mafia' | 'civilians' | null;
+    onNightAction: (
+        type:
+            | 'mafia_kill'
+            | 'detective_inspect'
+            | 'doctor_heal'
+            | 'lover_action',
+        targetUserId: string
+    ) => Promise<{ ok: boolean }>;
+    onVote: (
+        targetUserId: string | 'skip'
+    ) => Promise<{ ok: boolean }>;
     handleLogout: () => void;
     handleCopyId: () => void;
     setIsPaused: React.Dispatch<
@@ -29,6 +49,7 @@ export function RoomSidebar({
                                 room,
                                 playerName,
                                 currentUserId,
+                                myRole,
                                 currentPlayerIsDead,
                                 disconnectedPlayerIds,
                                 localStream,
@@ -36,6 +57,11 @@ export function RoomSidebar({
                                 timer,
                                 isPaused,
                                 isAdmin,
+                                voteTally,
+                                nightActionResult,
+                                winner,
+                                onNightAction,
+                                onVote,
                                 handleLogout,
                                 handleCopyId,
                                 setIsPaused,
@@ -128,6 +154,31 @@ export function RoomSidebar({
                         </div>
                     ) : null}
                 </div>
+
+                <ActionPanel
+                    phase={room.phase}
+                    myRole={myRole}
+                    myUserId={
+                        currentUserId
+                    }
+                    isDead={
+                        currentPlayerIsDead
+                    }
+                    players={
+                        room.players
+                    }
+                    voteTally={
+                        voteTally
+                    }
+                    nightActionResult={
+                        nightActionResult
+                    }
+                    winner={winner}
+                    onNightAction={
+                        onNightAction
+                    }
+                    onVote={onVote}
+                />
 
                 <PlayerList
                     players={room.players}

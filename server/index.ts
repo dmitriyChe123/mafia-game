@@ -14,6 +14,11 @@ import {
 } from "@supabase/supabase-js";
 import { AccessToken } from "livekit-server-sdk";
 import { assignRoles } from "./game/roles";
+import { GAME_PHASES } from "./game/phases";
+import {
+    normalizeRoomSize,
+    ROOM_SIZE_TARGETS,
+} from "./game/roomSize";
 
 // ======================================================
 // ENV
@@ -129,6 +134,7 @@ interface AuthenticatedRequest
 interface CreateRoomBody {
     name?: string;
     playerName?: string;
+    roomSize?: string;
 }
 
 interface JoinRoomBody {
@@ -326,6 +332,11 @@ app.post(
                 body.playerName?.trim() ||
                 "Player";
 
+            const roomSize =
+                normalizeRoomSize(
+                    body.roomSize
+                );
+
             const {
                 data: room,
                 error,
@@ -342,7 +353,7 @@ app.post(
                             room_type:
                                 "private",
                             room_size:
-                                "small",
+                            roomSize,
                             status:
                                 "waiting",
                         },
@@ -629,6 +640,45 @@ app.post(
             }
 
             const {
+                count: currentPlayerCount,
+                error: countError,
+            } =
+                await supaAdmin
+                    .from(
+                        "players_in_room"
+                    )
+                    .select("id", {
+                        count: "exact",
+                        head: true,
+                    })
+                    .eq(
+                        "room_id",
+                        roomId
+                    );
+
+            if (countError) {
+                throw countError;
+            }
+
+            const targetPlayers =
+                ROOM_SIZE_TARGETS[
+                    normalizeRoomSize(
+                        room.room_size
+                    )
+                    ];
+
+            if (
+                (currentPlayerCount ||
+                    0) >= targetPlayers
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "Кімната вже заповнена.",
+                });
+            }
+
+            const {
                 data: player,
                 error: joinError,
             } =
@@ -687,8 +737,998 @@ app.post(
 );
 
 // ======================================================
-// START GAME
+// MATCHMAKING
 // ======================================================
+//
+// Алгоритм за ТЗ (розділ 7):
+//   1. Якщо є waiting matchmaking-кімната цього
+//      room_size з вільним місцем — приєднуємось.
+//   2. Якщо ні — атомарно створюємо нову (унікальний
+//      індекс rooms_one_waiting_matchmaking_per_size
+//      гарантує, що при гонці двох запитів створиться
+//      лише одна).
+//   3. Коли кімната заповнюється до цільової кількості
+//      — призначаємо admin і кімната більше не
+//      вважається waiting-для-заповнення.
+
+app.post(
+    "/matchmaking/join",
+    requireAuth,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            const user = req.user;
+
+            if (!user) {
+                return res.status(401).json({
+                    ok: false,
+                    error:
+                        "User not authenticated",
+                });
+            }
+
+            const roomSize =
+                normalizeRoomSize(
+                    (req.body as {
+                        roomSize?: string;
+                    }).roomSize
+                );
+
+            const targetPlayers =
+                ROOM_SIZE_TARGETS[
+                    roomSize
+                    ];
+
+            let joinedRoomId:
+                string | null = null;
+
+            // До 3 спроб: між "знайти" і "вставити
+            // гравця" можлива гонка з іншими запитами
+            // (кімната встигла заповнитись) — просто
+            // пробуємо ще раз.
+            for (
+                let attempt = 0;
+                attempt < 3 &&
+                !joinedRoomId;
+                attempt++
+            ) {
+                const {
+                    data: waitingRoom,
+                    error:
+                        findError,
+                } =
+                    await supaAdmin
+                        .from("rooms")
+                        .select(
+                            "id"
+                        )
+                        .eq(
+                            "room_type",
+                            "matchmaking"
+                        )
+                        .eq(
+                            "room_size",
+                            roomSize
+                        )
+                        .eq(
+                            "matchmaking_open",
+                            true
+                        )
+                        .order(
+                            "created_at",
+                            {
+                                ascending:
+                                    true,
+                            }
+                        )
+                        .limit(1)
+                        .maybeSingle();
+
+                if (findError) {
+                    throw findError;
+                }
+
+                let roomId =
+                    waitingRoom?.id ||
+                    null;
+
+                if (!roomId) {
+                    const {
+                        data: createdRoom,
+                        error:
+                            createError,
+                    } =
+                        await supaAdmin
+                            .from(
+                                "rooms"
+                            )
+                            .insert([
+                                {
+                                    name: "Matchmaking Room",
+                                    admin_id: null,
+                                    created_by: null,
+                                    room_type:
+                                        "matchmaking",
+                                    room_size:
+                                    roomSize,
+                                    status:
+                                        "waiting",
+                                },
+                            ])
+                            .select(
+                                "id"
+                            )
+                            .single();
+
+                    if (createError) {
+                        // Унікальний індекс не дав
+                        // створити другу waiting-кімнату
+                        // цього розміру — хтось інший
+                        // щойно її створив. Пробуємо
+                        // знайти її на наступній ітерації.
+                        if (
+                            (createError as any)
+                                .code === "23505"
+                        ) {
+                            continue;
+                        }
+
+                        throw createError;
+                    }
+
+                    roomId =
+                        createdRoom.id;
+                }
+
+                const {
+                    error: joinError,
+                } =
+                    await supaAdmin
+                        .from(
+                            "players_in_room"
+                        )
+                        .insert([
+                            {
+                                room_id:
+                                roomId,
+                                user_id:
+                                user.id,
+                                display_name:
+                                    user.user_metadata
+                                        ?.name ||
+                                    user.email?.split(
+                                        "@"
+                                    )[0] ||
+                                    "Player",
+                                status:
+                                    "alive",
+                                connection_status:
+                                    "connected",
+                                last_seen_at:
+                                    new Date().toISOString(),
+                            },
+                        ]);
+
+                if (joinError) {
+                    // (room_id, user_id) unique —
+                    // або кімната вже повна й хтось
+                    // встиг раніше. Пробуємо ще раз.
+                    continue;
+                }
+
+                joinedRoomId = roomId;
+
+                const {
+                    count: playerCount,
+                    error: countError,
+                } =
+                    await supaAdmin
+                        .from(
+                            "players_in_room"
+                        )
+                        .select("id", {
+                            count: "exact",
+                            head: true,
+                        })
+                        .eq(
+                            "room_id",
+                            roomId
+                        );
+
+                if (countError) {
+                    throw countError;
+                }
+
+                if (
+                    (playerCount ||
+                        0) >=
+                    targetPlayers
+                ) {
+                    const {
+                        data: firstPlayer,
+                    } =
+                        await supaAdmin
+                            .from(
+                                "players_in_room"
+                            )
+                            .select(
+                                "user_id"
+                            )
+                            .eq(
+                                "room_id",
+                                roomId
+                            )
+                            .order(
+                                "joined_at",
+                                {
+                                    ascending:
+                                        true,
+                                }
+                            )
+                            .limit(1)
+                            .maybeSingle();
+
+                    await supaAdmin
+                        .from("rooms")
+                        .update({
+                            admin_id:
+                                firstPlayer?.user_id ||
+                                user.id,
+
+                            // Прибираємо з пулу
+                            // "waiting matchmaking" —
+                            // унікальний індекс звільняє
+                            // місце для наступної кімнати
+                            // цього розміру.
+                            matchmaking_open:
+                                false,
+                        })
+                        .eq(
+                            "id",
+                            roomId
+                        );
+                }
+            }
+
+            if (!joinedRoomId) {
+                return res.status(409).json({
+                    ok: false,
+                    error:
+                        "Не вдалося приєднатись до matchmaking. Спробуй ще раз.",
+                });
+            }
+
+            return res.json({
+                ok: true,
+                data: {
+                    roomId:
+                    joinedRoomId,
+                },
+            });
+        } catch (error) {
+            console.error(
+                "MATCHMAKING JOIN ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                ok: false,
+                error:
+                    "Failed to join matchmaking",
+            });
+        }
+    }
+);
+
+app.post(
+    "/matchmaking/leave",
+    requireAuth,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            const user = req.user;
+
+            if (!user) {
+                return res.status(401).json({
+                    ok: false,
+                    error:
+                        "User not authenticated",
+                });
+            }
+
+            const roomId = (
+                req.body as {
+                    roomId?: string;
+                }
+            ).roomId;
+
+            if (!roomId) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "roomId required",
+                });
+            }
+
+            const {
+                data: room,
+                error: roomError,
+            } =
+                await supaAdmin
+                    .from("rooms")
+                    .select(
+                        "id, room_type, status"
+                    )
+                    .eq(
+                        "id",
+                        roomId
+                    )
+                    .maybeSingle();
+
+            if (roomError) {
+                throw roomError;
+            }
+
+            if (
+                !room ||
+                room.room_type !==
+                "matchmaking"
+            ) {
+                return res.status(404).json({
+                    ok: false,
+                    error:
+                        "Matchmaking room not found",
+                });
+            }
+
+            await supaAdmin
+                .from(
+                    "players_in_room"
+                )
+                .delete()
+                .eq(
+                    "room_id",
+                    roomId
+                )
+                .eq(
+                    "user_id",
+                    user.id
+                );
+
+            const {
+                count: remaining,
+                error: countError,
+            } =
+                await supaAdmin
+                    .from(
+                        "players_in_room"
+                    )
+                    .select("id", {
+                        count: "exact",
+                        head: true,
+                    })
+                    .eq(
+                        "room_id",
+                        roomId
+                    );
+
+            if (countError) {
+                throw countError;
+            }
+
+            if (
+                (remaining || 0) ===
+                0 &&
+                room.status !==
+                "playing"
+            ) {
+                // Порожня matchmaking-кімната —
+                // прибираємо, щоб не накопичувати
+                // сміттєві rooms (ТЗ 6.4).
+                await supaAdmin
+                    .from("rooms")
+                    .delete()
+                    .eq(
+                        "id",
+                        roomId
+                    );
+            } else if (
+                room.status ===
+                "waiting"
+            ) {
+                // Звільнилось місце до старту гри —
+                // знову відкриваємо кімнату для
+                // matchmaking (якщо вона була закрита
+                // через заповнення).
+                await supaAdmin
+                    .from("rooms")
+                    .update({
+                        matchmaking_open:
+                            true,
+                    })
+                    .eq(
+                        "id",
+                        roomId
+                    );
+            }
+
+            return res.json({
+                ok: true,
+            });
+        } catch (error) {
+            console.error(
+                "MATCHMAKING LEAVE ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                ok: false,
+                error:
+                    "Failed to leave matchmaking",
+            });
+        }
+    }
+);
+
+// ======================================================
+// GAME ENGINE (authoritative phases / night / voting)
+// ======================================================
+//
+// В пам'яті процесу — свідомий компроміс для MVP:
+// нічні дії та голоси поточного раунду не переживуть
+// рестарт backend-процесу (наприклад, redeploy на
+// Render). Сама фаза/таймер персистяться в rooms
+// (див. міграцію rooms_game_state_columns), тож
+// reconnect і "хто на якій фазі" переживають рестарт —
+// лише дії конкретної ночі/голосування довелось би
+// повторити, якщо backend впаде рівно в цей момент.
+
+type NightActionType =
+    | "mafia_kill"
+    | "detective_inspect"
+    | "doctor_heal"
+    | "lover_action";
+
+interface NightAction {
+    type: NightActionType;
+    targetUserId: string;
+}
+
+const roomPhaseTimers =
+    new Map<string, NodeJS.Timeout>();
+
+const roomNightActions =
+    new Map<
+        string,
+        Map<string, NightAction>
+    >();
+
+const roomVotes =
+    new Map<
+        string,
+        Map<string, string>
+    >();
+
+const ROLE_NIGHT_ACTIONS: Record<
+    string,
+    NightActionType[]
+> = {
+    mafia: ["mafia_kill"],
+    boss: ["mafia_kill"],
+    detective: ["detective_inspect"],
+    doctor: ["doctor_heal"],
+    lover: ["lover_action"],
+    civilian: [],
+};
+
+async function getRoomPlayers(
+    roomId: string
+) {
+    const {
+        data,
+        error,
+    } =
+        await supaAdmin
+            .from("players_in_room")
+            .select(
+                "user_id, role, status"
+            )
+            .eq("room_id", roomId);
+
+    if (error) {
+        throw error;
+    }
+
+    return data || [];
+}
+
+function computeWinner(
+    players: {
+        role: string | null;
+        status: string;
+    }[]
+): "mafia" | "civilians" | null {
+    const alive = players.filter(
+        (p) => p.status === "alive"
+    );
+
+    const mafiaAlive = alive.filter(
+        (p) =>
+            p.role === "mafia" ||
+            p.role === "boss"
+    ).length;
+
+    const othersAlive =
+        alive.length - mafiaAlive;
+
+    if (alive.length === 0) {
+        return null;
+    }
+
+    if (mafiaAlive === 0) {
+        return "civilians";
+    }
+
+    if (mafiaAlive >= othersAlive) {
+        return "mafia";
+    }
+
+    return null;
+}
+
+function clearRoomTimer(
+    roomId: string
+) {
+    const existing =
+        roomPhaseTimers.get(roomId);
+
+    if (existing) {
+        clearTimeout(existing);
+    }
+
+    roomPhaseTimers.delete(roomId);
+}
+
+async function transitionToPhase(
+    roomId: string,
+    phaseIndex: number
+) {
+    const phaseConfig =
+        GAME_PHASES[phaseIndex];
+
+    const startedAt = new Date();
+
+    const endsAt =
+        phaseConfig.hasTimer &&
+        phaseConfig.duration
+            ? new Date(
+                startedAt.getTime() +
+                phaseConfig.duration *
+                1000
+            )
+            : null;
+
+    await supaAdmin
+        .from("rooms")
+        .update({
+            phase: phaseConfig.key,
+            phase_index: phaseIndex,
+            phase_started_at:
+                startedAt.toISOString(),
+            phase_ends_at:
+                endsAt
+                    ? endsAt.toISOString()
+                    : null,
+        })
+        .eq("id", roomId);
+
+    io.to(roomId).emit(
+        "phase-changed",
+        {
+            phase: phaseConfig.key,
+            phaseIndex,
+            phaseStartedAt:
+                startedAt.toISOString(),
+            phaseEndsAt:
+                endsAt
+                    ? endsAt.toISOString()
+                    : null,
+        }
+    );
+
+    clearRoomTimer(roomId);
+
+    if (
+        phaseConfig.hasTimer &&
+        phaseConfig.duration
+    ) {
+        const timer = setTimeout(
+            () => {
+                advancePhase(
+                    roomId
+                ).catch((error) =>
+                    console.error(
+                        "AUTO ADVANCE ERROR:",
+                        error
+                    )
+                );
+            },
+            phaseConfig.duration * 1000
+        );
+
+        roomPhaseTimers.set(
+            roomId,
+            timer
+        );
+    }
+}
+
+async function resolveNight(
+    roomId: string
+) {
+    const actions =
+        roomNightActions.get(
+            roomId
+        ) || new Map();
+
+    const players =
+        await getRoomPlayers(roomId);
+
+    const killVotes = new Map<
+        string,
+        number
+    >();
+
+    let doctorHealTarget:
+        string | null = null;
+
+    const detectiveInspections: {
+        actorId: string;
+        targetId: string;
+    }[] = [];
+
+    for (const [
+        actorId,
+        action,
+    ] of actions.entries()) {
+        if (
+            action.type ===
+            "mafia_kill"
+        ) {
+            killVotes.set(
+                action.targetUserId,
+                (killVotes.get(
+                        action.targetUserId
+                    ) || 0) + 1
+            );
+        } else if (
+            action.type ===
+            "doctor_heal"
+        ) {
+            doctorHealTarget =
+                action.targetUserId;
+        } else if (
+            action.type ===
+            "detective_inspect"
+        ) {
+            detectiveInspections.push(
+                {
+                    actorId,
+                    targetId:
+                    action.targetUserId,
+                }
+            );
+        }
+    }
+
+    let killTargetId:
+        string | null = null;
+
+    let maxKillVotes = 0;
+
+    for (const [
+        targetId,
+        count,
+    ] of killVotes.entries()) {
+        if (count > maxKillVotes) {
+            maxKillVotes = count;
+            killTargetId = targetId;
+        }
+    }
+
+    const saved =
+        !!killTargetId &&
+        killTargetId ===
+        doctorHealTarget;
+
+    if (killTargetId && !saved) {
+        await supaAdmin
+            .from(
+                "players_in_room"
+            )
+            .update({
+                status: "dead",
+            })
+            .eq(
+                "room_id",
+                roomId
+            )
+            .eq(
+                "user_id",
+                killTargetId
+            );
+
+        const deadPlayer =
+            players.find(
+                (p) =>
+                    p.user_id ===
+                    killTargetId
+            );
+
+        io.to(roomId).emit(
+            "player-died",
+            {
+                userId:
+                killTargetId,
+                role:
+                    deadPlayer?.role ||
+                    null,
+            }
+        );
+    }
+
+    for (const inspection of detectiveInspections) {
+        const target =
+            players.find(
+                (p) =>
+                    p.user_id ===
+                    inspection.targetId
+            );
+
+        const isMafia =
+            target?.role ===
+            "mafia" ||
+            target?.role === "boss";
+
+        io.to(
+            `user:${inspection.actorId}`
+        ).emit(
+            "night-action-result",
+            {
+                type:
+                    "detective_inspect",
+                targetUserId:
+                inspection.targetId,
+                result: isMafia,
+            }
+        );
+    }
+
+    roomNightActions.delete(roomId);
+}
+
+async function resolveVoting(
+    roomId: string
+) {
+    const votesForRoom =
+        roomVotes.get(roomId) ||
+        new Map();
+
+    const tally = new Map<
+        string,
+        number
+    >();
+
+    for (const targetId of votesForRoom.values()) {
+        if (targetId === "skip") {
+            continue;
+        }
+
+        tally.set(
+            targetId,
+            (tally.get(targetId) ||
+                0) + 1
+        );
+    }
+
+    let eliminatedId:
+        string | null = null;
+
+    let maxVotes = 0;
+
+    let isTie = false;
+
+    for (const [
+        targetId,
+        count,
+    ] of tally.entries()) {
+        if (count > maxVotes) {
+            maxVotes = count;
+            eliminatedId = targetId;
+            isTie = false;
+        } else if (
+            count === maxVotes &&
+            maxVotes > 0
+        ) {
+            isTie = true;
+        }
+    }
+
+    if (isTie) {
+        eliminatedId = null;
+    }
+
+    if (eliminatedId) {
+        await supaAdmin
+            .from(
+                "players_in_room"
+            )
+            .update({
+                status: "dead",
+            })
+            .eq(
+                "room_id",
+                roomId
+            )
+            .eq(
+                "user_id",
+                eliminatedId
+            );
+    }
+
+    const players =
+        await getRoomPlayers(roomId);
+
+    const eliminatedPlayer =
+        eliminatedId
+            ? players.find(
+                (p) =>
+                    p.user_id ===
+                    eliminatedId
+            )
+            : null;
+
+    io.to(roomId).emit(
+        "voting-finished",
+        {
+            eliminatedUserId:
+                eliminatedId,
+            role:
+                eliminatedPlayer?.role ||
+                null,
+        }
+    );
+
+    roomVotes.delete(roomId);
+}
+
+async function endGame(
+    roomId: string,
+    winner: "mafia" | "civilians"
+) {
+    clearRoomTimer(roomId);
+
+    const endIndex =
+        GAME_PHASES.findIndex(
+            (p) => p.key === "end"
+        );
+
+    await supaAdmin
+        .from("rooms")
+        .update({
+            status: "finished",
+            phase: "end",
+            phase_index: endIndex,
+            phase_started_at:
+                new Date().toISOString(),
+            phase_ends_at: null,
+            winner,
+        })
+        .eq("id", roomId);
+
+    io.to(roomId).emit(
+        "game-over",
+        { winner }
+    );
+
+    roomNightActions.delete(roomId);
+    roomVotes.delete(roomId);
+}
+
+async function advancePhase(
+    roomId: string
+) {
+    const {
+        data: room,
+        error,
+    } =
+        await supaAdmin
+            .from("rooms")
+            .select(
+                "id, status, phase_index, day_number"
+            )
+            .eq("id", roomId)
+            .maybeSingle();
+
+    if (error) {
+        throw error;
+    }
+
+    if (!room || room.status !== "playing") {
+        return;
+    }
+
+    const currentIndex =
+        room.phase_index;
+
+    const currentPhase =
+        GAME_PHASES[currentIndex];
+
+    if (!currentPhase) {
+        return;
+    }
+
+    if (currentPhase.key === "night") {
+        await resolveNight(roomId);
+    }
+
+    if (
+        currentPhase.key === "voting"
+    ) {
+        await resolveVoting(roomId);
+    }
+
+    const players =
+        await getRoomPlayers(roomId);
+
+    const winner =
+        computeWinner(players);
+
+    if (winner) {
+        await endGame(
+            roomId,
+            winner
+        );
+
+        return;
+    }
+
+    let nextIndex =
+        currentIndex + 1;
+
+    if (
+        currentPhase.key === "voting" ||
+        nextIndex >=
+        GAME_PHASES.length
+    ) {
+        // Раунд завершився без переможця —
+        // повертаємось на ніч наступного дня
+        // (а не на role_distribution: ролі
+        // роздаються рівно один раз за гру).
+        nextIndex =
+            GAME_PHASES.findIndex(
+                (p) => p.key === "night"
+            );
+
+        await supaAdmin
+            .from("rooms")
+            .update({
+                day_number:
+                    (room.day_number ||
+                        1) + 1,
+            })
+            .eq("id", roomId);
+    }
+
+    await transitionToPhase(
+        roomId,
+        nextIndex
+    );
+}
 
 app.post(
     "/rooms/:id/start",
@@ -718,7 +1758,7 @@ app.post(
                 await supaAdmin
                     .from("rooms")
                     .select(
-                        "id, admin_id, status"
+                        "id, admin_id, status, room_size"
                     )
                     .eq(
                         "id",
@@ -802,7 +1842,10 @@ app.post(
             // ==========================================
 
             const roles = assignRoles(
-                players.length
+                players.length,
+                normalizeRoomSize(
+                    room.room_size
+                )
             );
 
             const shuffledPlayers = [
@@ -897,6 +1940,11 @@ app.post(
                 "game-started"
             );
 
+            await transitionToPhase(
+                roomId,
+                0
+            );
+
             assignments.forEach(
                 ({ userId, role }) => {
                     io.to(
@@ -925,6 +1973,508 @@ app.post(
                     error instanceof Error
                         ? error.message
                         : "Failed to start game",
+            });
+        }
+    }
+);
+
+// ======================================================
+// NEXT PHASE (admin-only manual advance)
+// ======================================================
+
+app.post(
+    "/rooms/:id/next-phase",
+    requireAuth,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            const roomId =
+                req.params.id;
+
+            const userId =
+                req.user!.id;
+
+            const {
+                data: room,
+                error,
+            } =
+                await supaAdmin
+                    .from("rooms")
+                    .select(
+                        "id, admin_id, status, phase_index"
+                    )
+                    .eq(
+                        "id",
+                        roomId
+                    )
+                    .maybeSingle();
+
+            if (error) {
+                throw error;
+            }
+
+            if (!room) {
+                return res.status(404).json({
+                    ok: false,
+                    error:
+                        "Room not found",
+                });
+            }
+
+            if (
+                room.admin_id !==
+                userId
+            ) {
+                return res.status(403).json({
+                    ok: false,
+                    error:
+                        "Only admin can advance the phase",
+                });
+            }
+
+            if (
+                room.status !==
+                "playing"
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "Game is not currently playing",
+                });
+            }
+
+            if (
+                GAME_PHASES[
+                    room.phase_index
+                    ]?.key === "end"
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "Game has already ended",
+                });
+            }
+
+            await advancePhase(
+                roomId
+            );
+
+            return res.json({
+                ok: true,
+            });
+        } catch (error) {
+            console.error(
+                "NEXT PHASE ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                ok: false,
+                error:
+                    "Failed to advance phase",
+            });
+        }
+    }
+);
+
+// ======================================================
+// NIGHT ACTION
+// ======================================================
+
+app.post(
+    "/rooms/:id/night-action",
+    requireAuth,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            const roomId =
+                req.params.id;
+
+            const userId =
+                req.user!.id;
+
+            const {
+                type,
+                targetUserId,
+            } = req.body as {
+                type?: NightActionType;
+                targetUserId?: string;
+            };
+
+            if (
+                !type ||
+                !targetUserId
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "type and targetUserId are required",
+                });
+            }
+
+            const {
+                data: room,
+                error: roomError,
+            } =
+                await supaAdmin
+                    .from("rooms")
+                    .select(
+                        "id, status, phase"
+                    )
+                    .eq(
+                        "id",
+                        roomId
+                    )
+                    .maybeSingle();
+
+            if (roomError) {
+                throw roomError;
+            }
+
+            if (
+                !room ||
+                room.status !==
+                "playing" ||
+                room.phase !== "night"
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "Night actions are only allowed during the night phase",
+                });
+            }
+
+            const {
+                data: actor,
+                error: actorError,
+            } =
+                await supaAdmin
+                    .from(
+                        "players_in_room"
+                    )
+                    .select(
+                        "role, status"
+                    )
+                    .eq(
+                        "room_id",
+                        roomId
+                    )
+                    .eq(
+                        "user_id",
+                        userId
+                    )
+                    .maybeSingle();
+
+            if (actorError) {
+                throw actorError;
+            }
+
+            if (
+                !actor ||
+                actor.status !==
+                "alive"
+            ) {
+                return res.status(403).json({
+                    ok: false,
+                    error:
+                        "Only alive players can act",
+                });
+            }
+
+            const allowedActions =
+                ROLE_NIGHT_ACTIONS[
+                    actor.role || ""
+                    ] || [];
+
+            if (
+                !allowedActions.includes(
+                    type
+                )
+            ) {
+                return res.status(403).json({
+                    ok: false,
+                    error:
+                        "Your role cannot perform this action",
+                });
+            }
+
+            const {
+                data: target,
+                error: targetError,
+            } =
+                await supaAdmin
+                    .from(
+                        "players_in_room"
+                    )
+                    .select("status")
+                    .eq(
+                        "room_id",
+                        roomId
+                    )
+                    .eq(
+                        "user_id",
+                        targetUserId
+                    )
+                    .maybeSingle();
+
+            if (targetError) {
+                throw targetError;
+            }
+
+            if (
+                !target ||
+                target.status !==
+                "alive"
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "Target must be an alive player in this room",
+                });
+            }
+
+            const actionsForRoom =
+                roomNightActions.get(
+                    roomId
+                ) ||
+                new Map<
+                    string,
+                    NightAction
+                >();
+
+            if (
+                actionsForRoom.has(
+                    userId
+                )
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "You already acted this night",
+                });
+            }
+
+            actionsForRoom.set(
+                userId,
+                {
+                    type,
+                    targetUserId,
+                }
+            );
+
+            roomNightActions.set(
+                roomId,
+                actionsForRoom
+            );
+
+            return res.json({
+                ok: true,
+            });
+        } catch (error) {
+            console.error(
+                "NIGHT ACTION ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                ok: false,
+                error:
+                    "Failed to submit night action",
+            });
+        }
+    }
+);
+
+// ======================================================
+// VOTE
+// ======================================================
+
+app.post(
+    "/rooms/:id/vote",
+    requireAuth,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            const roomId =
+                req.params.id;
+
+            const userId =
+                req.user!.id;
+
+            const {
+                targetUserId,
+            } = req.body as {
+                targetUserId?: string;
+            };
+
+            const {
+                data: room,
+                error: roomError,
+            } =
+                await supaAdmin
+                    .from("rooms")
+                    .select(
+                        "id, status, phase"
+                    )
+                    .eq(
+                        "id",
+                        roomId
+                    )
+                    .maybeSingle();
+
+            if (roomError) {
+                throw roomError;
+            }
+
+            if (
+                !room ||
+                room.status !==
+                "playing" ||
+                room.phase !==
+                "voting"
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "Voting is only allowed during the voting phase",
+                });
+            }
+
+            const {
+                data: voter,
+                error: voterError,
+            } =
+                await supaAdmin
+                    .from(
+                        "players_in_room"
+                    )
+                    .select("status")
+                    .eq(
+                        "room_id",
+                        roomId
+                    )
+                    .eq(
+                        "user_id",
+                        userId
+                    )
+                    .maybeSingle();
+
+            if (voterError) {
+                throw voterError;
+            }
+
+            if (
+                !voter ||
+                voter.status !==
+                "alive"
+            ) {
+                return res.status(403).json({
+                    ok: false,
+                    error:
+                        "Only alive players can vote",
+                });
+            }
+
+            const finalTarget =
+                targetUserId ||
+                "skip";
+
+            if (
+                finalTarget !==
+                "skip"
+            ) {
+                const {
+                    data: target,
+                    error: targetError,
+                } =
+                    await supaAdmin
+                        .from(
+                            "players_in_room"
+                        )
+                        .select(
+                            "status"
+                        )
+                        .eq(
+                            "room_id",
+                            roomId
+                        )
+                        .eq(
+                            "user_id",
+                            finalTarget
+                        )
+                        .maybeSingle();
+
+                if (targetError) {
+                    throw targetError;
+                }
+
+                if (
+                    !target ||
+                    target.status !==
+                    "alive"
+                ) {
+                    return res.status(400).json({
+                        ok: false,
+                        error:
+                            "Target must be an alive player in this room",
+                    });
+                }
+            }
+
+            const votesForRoom =
+                roomVotes.get(
+                    roomId
+                ) ||
+                new Map<
+                    string,
+                    string
+                >();
+
+            votesForRoom.set(
+                userId,
+                finalTarget
+            );
+
+            roomVotes.set(
+                roomId,
+                votesForRoom
+            );
+
+            const tally: Record<
+                string,
+                number
+            > = {};
+
+            for (const t of votesForRoom.values()) {
+                tally[t] =
+                    (tally[t] || 0) +
+                    1;
+            }
+
+            io.to(roomId).emit(
+                "vote-updated",
+                { tally }
+            );
+
+            return res.json({
+                ok: true,
+            });
+        } catch (error) {
+            console.error(
+                "VOTE ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                ok: false,
+                error:
+                    "Failed to submit vote",
             });
         }
     }
@@ -1863,6 +3413,56 @@ interface ServerToClientEvents {
                 | "doctor"
                 | "lover"
                 | "civilian";
+        }
+    ) => void;
+
+    "phase-changed": (
+        data: {
+            phase: string;
+            phaseIndex: number;
+            phaseStartedAt: string;
+            phaseEndsAt:
+                string | null;
+        }
+    ) => void;
+
+    "night-action-result": (
+        data: {
+            type: string;
+            targetUserId: string;
+            result: boolean;
+        }
+    ) => void;
+
+    "player-died": (
+        data: {
+            userId: string;
+            role: string | null;
+        }
+    ) => void;
+
+    "vote-updated": (
+        data: {
+            tally: Record<
+                string,
+                number
+            >;
+        }
+    ) => void;
+
+    "voting-finished": (
+        data: {
+            eliminatedUserId:
+                string | null;
+            role: string | null;
+        }
+    ) => void;
+
+    "game-over": (
+        data: {
+            winner:
+                | "mafia"
+                | "civilians";
         }
     ) => void;
 }

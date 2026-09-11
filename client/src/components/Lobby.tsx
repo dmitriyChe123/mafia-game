@@ -31,6 +31,11 @@ export default function Lobby({
     const [roomId, setRoomId] = useState('');
     const [loading, setLoading] = useState(false);
 
+    const [roomSize, setRoomSize] =
+        useState<'small' | 'large'>(
+            'small'
+        );
+
     // ==================================================
     // LOAD USER NAME
     // ==================================================
@@ -150,6 +155,8 @@ export default function Lobby({
                          */
 
                         name: 'Mafia Room',
+
+                        roomSize,
 
                         /*
                          * Actual player name.
@@ -354,6 +361,99 @@ export default function Lobby({
     };
 
     // ==================================================
+    // MATCHMAKING (знайти гру)
+    // ==================================================
+
+    const findMatch = async () => {
+        const session = await getSession();
+
+        const playerDisplayName =
+            name.trim() || 'Player';
+
+        const response = await fetch(
+            `${API}/matchmaking/join`,
+            {
+                method: 'POST',
+
+                headers: {
+                    'Content-Type':
+                        'application/json',
+
+                    Authorization: `Bearer ${session.access_token}`,
+                },
+
+                body: JSON.stringify({
+                    roomSize,
+                }),
+            }
+        );
+
+        const result =
+            await response.json();
+
+        if (
+            !response.ok ||
+            !result.ok
+        ) {
+            throw new Error(
+                typeof result.error ===
+                'string'
+                    ? result.error
+                    : 'Не вдалося знайти гру'
+            );
+        }
+
+        const matchedRoomId =
+            result.data.roomId as string;
+
+        // Далі — той самий шлях, що й ручний
+        // join за кодом кімнати: реєструємось
+        // у players_in_room (matchmaking вже це
+        // зробив), тож просто дізнаємось поточний
+        // стан room і переходимо всередину.
+
+        const roomResponse = await fetch(
+            `${API}/rooms/${matchedRoomId}`,
+            {
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`,
+                },
+            }
+        );
+
+        const roomResult =
+            await roomResponse.json();
+
+        const backendRoom =
+            roomResult.data as BackendRoom;
+
+        const room: RoomState = {
+            id: matchedRoomId,
+
+            players: [],
+
+            phase: 'lobby',
+
+            currentPhaseIndex: 0,
+
+            adminId:
+            backendRoom?.admin_id,
+        };
+
+        localStorage.setItem(
+            'playerName',
+            playerDisplayName
+        );
+
+        localStorage.setItem(
+            'roomId',
+            room.id
+        );
+
+        onCreateRoom(room);
+    };
+
+    // ==================================================
     // ACTION
     // ==================================================
 
@@ -386,6 +486,33 @@ export default function Lobby({
             setLoading(false);
         }
     };
+
+    const handleFindMatch =
+        async () => {
+            if (!name.trim()) {
+                alert('Введіть ім’я!');
+                return;
+            }
+
+            setLoading(true);
+
+            try {
+                await findMatch();
+            } catch (error) {
+                console.error(
+                    'MATCHMAKING ERROR:',
+                    error
+                );
+
+                alert(
+                    error instanceof Error
+                        ? error.message
+                        : 'Сталася помилка'
+                );
+            } finally {
+                setLoading(false);
+            }
+        };
 
     // ==================================================
     // RENDER
@@ -423,6 +550,40 @@ export default function Lobby({
                 disabled={loading}
             />
 
+            {/* ROOM SIZE */}
+
+            <div className="flex w-80 gap-2">
+                <button
+                    type="button"
+                    onClick={() =>
+                        setRoomSize('small')
+                    }
+                    disabled={loading}
+                    className={`flex-1 rounded border px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                        roomSize === 'small'
+                            ? 'border-blue-500 bg-blue-600 text-white'
+                            : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-500'
+                    }`}
+                >
+                    Small (8)
+                </button>
+
+                <button
+                    type="button"
+                    onClick={() =>
+                        setRoomSize('large')
+                    }
+                    disabled={loading}
+                    className={`flex-1 rounded border px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                        roomSize === 'large'
+                            ? 'border-blue-500 bg-blue-600 text-white'
+                            : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-500'
+                    }`}
+                >
+                    Large (11)
+                </button>
+            </div>
+
             {/* ROOM ID */}
 
             <input
@@ -449,6 +610,18 @@ export default function Lobby({
                         ? 'Join Room'
                         : 'Create Room'}
             </button>
+
+            {/* FIND MATCH */}
+
+            {!roomId.trim() ? (
+                <button
+                    onClick={handleFindMatch}
+                    disabled={loading}
+                    className="w-80 rounded border border-purple-600 bg-purple-900/30 px-4 py-3 font-semibold text-purple-200 transition hover:bg-purple-900/60 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                    🔎 Знайти гру ({roomSize === 'small' ? 'Small' : 'Large'})
+                </button>
+            ) : null}
         </div>
     );
 }
