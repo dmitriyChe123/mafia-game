@@ -173,6 +173,115 @@ export function Room({
     }, []);
 
     // ==================================================
+    // SYNC PHASE/TIMER/WINNER ON MOUNT (reconnect/refresh)
+    //
+    // На відміну від loadPlayers (опитування кожні 2с
+    // для players/roles), фазу й таймер синхронізуємо
+    // один раз при заході в кімнату — далі вони authoritative
+    // оновлюються лише через socket-подію "phase-changed".
+    // Без цього рефреш сторінки посеред гри показував би
+    // застарілу фазу з localStorage.
+    // ==================================================
+
+    useEffect(() => {
+        if (!room.id) return;
+
+        let cancelled = false;
+
+        const syncRoomPhase = async () => {
+            try {
+                const {
+                    data: { session },
+                } =
+                    await supabase.auth.getSession();
+
+                if (
+                    !session?.access_token
+                ) {
+                    return;
+                }
+
+                const res = await fetch(
+                    `${API}/rooms/${room.id}`,
+                    {
+                        headers: {
+                            Authorization: `Bearer ${session.access_token}`,
+                        },
+                    }
+                );
+
+                const json =
+                    await res.json();
+
+                if (
+                    cancelled ||
+                    !json.ok ||
+                    !json.data
+                ) {
+                    return;
+                }
+
+                const backendRoom =
+                    json.data;
+
+                setRoom(
+                    (current) => ({
+                        ...current,
+                        phase:
+                            (backendRoom.phase as any) ||
+                            current.phase,
+                        currentPhaseIndex:
+                            backendRoom.phase_index ??
+                            current.currentPhaseIndex,
+                        adminId:
+                            backendRoom.admin_id ||
+                            current.adminId,
+                    })
+                );
+
+                if (
+                    backendRoom.phase_ends_at
+                ) {
+                    const remaining =
+                        Math.max(
+                            0,
+                            Math.round(
+                                (new Date(
+                                    backendRoom.phase_ends_at
+                                ).getTime() -
+                                    Date.now()) /
+                                1000
+                            )
+                        );
+
+                    setTimer(remaining);
+                } else {
+                    setTimer(null);
+                }
+
+                if (
+                    backendRoom.winner
+                ) {
+                    setWinner(
+                        backendRoom.winner
+                    );
+                }
+            } catch (error) {
+                console.error(
+                    'ROOM PHASE SYNC ERROR:',
+                    error
+                );
+            }
+        };
+
+        syncRoomPhase();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [room.id]);
+
+    // ==================================================
     // ADMIN
     // ==================================================
 
@@ -1351,19 +1460,32 @@ export function Room({
     // REPEAT
     // ==================================================
 
-    const handleRepeatPhase = () => {
-        const current =
-            GAME_PHASES.find(
-                (phase) =>
-                    phase.key === room.phase
-            );
+    const handleRepeatPhase =
+        async () => {
+            if (!isAdmin) return;
 
-        if (current?.duration) {
-            setTimer(
-                current.duration
-            );
-        }
-    };
+            try {
+                const {
+                    data: { session },
+                } =
+                    await supabase.auth.getSession();
+
+                await fetch(
+                    `${API}/rooms/${room.id}/repeat-phase`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            Authorization: `Bearer ${session?.access_token}`,
+                        },
+                    }
+                );
+            } catch (error) {
+                console.error(
+                    'REPEAT PHASE ERROR:',
+                    error
+                );
+            }
+        };
 
     // ==================================================
     // COPY

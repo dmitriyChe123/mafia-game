@@ -2080,6 +2080,97 @@ app.post(
 );
 
 // ======================================================
+// REPEAT PHASE (admin-only — перезапустити таймер
+// поточної фази, не переходячи на наступну)
+// ======================================================
+
+app.post(
+    "/rooms/:id/repeat-phase",
+    requireAuth,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            const roomId =
+                req.params.id;
+
+            const userId =
+                req.user!.id;
+
+            const {
+                data: room,
+                error,
+            } =
+                await supaAdmin
+                    .from("rooms")
+                    .select(
+                        "id, admin_id, status, phase_index"
+                    )
+                    .eq(
+                        "id",
+                        roomId
+                    )
+                    .maybeSingle();
+
+            if (error) {
+                throw error;
+            }
+
+            if (!room) {
+                return res.status(404).json({
+                    ok: false,
+                    error:
+                        "Room not found",
+                });
+            }
+
+            if (
+                room.admin_id !==
+                userId
+            ) {
+                return res.status(403).json({
+                    ok: false,
+                    error:
+                        "Only admin can repeat the phase",
+                });
+            }
+
+            if (
+                room.status !==
+                "playing"
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        "Game is not currently playing",
+                });
+            }
+
+            await transitionToPhase(
+                roomId,
+                room.phase_index
+            );
+
+            return res.json({
+                ok: true,
+            });
+        } catch (error) {
+            console.error(
+                "REPEAT PHASE ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                ok: false,
+                error:
+                    "Failed to repeat phase",
+            });
+        }
+    }
+);
+
+// ======================================================
 // NIGHT ACTION
 // ======================================================
 
@@ -2512,7 +2603,7 @@ app.delete(
                 await supaAdmin
                     .from("rooms")
                     .select(
-                        "id, admin_id, status"
+                        "id, admin_id, status, room_type"
                     )
                     .eq(
                         "id",
@@ -2695,6 +2786,66 @@ app.delete(
             // If nobody is disconnected anymore,
             // clear connection state.
             // --------------------------------------------------
+
+            // --------------------------------------------------
+            // Matchmaking room, що спорожніла до старту
+            // гри — прибираємо (ТЗ 6.4), незалежно від
+            // того, через яку саме кнопку вийшов гравець.
+            // --------------------------------------------------
+
+            if (
+                room.room_type ===
+                "matchmaking" &&
+                room.status !==
+                "playing"
+            ) {
+                const {
+                    count: remaining,
+                } =
+                    await supaAdmin
+                        .from(
+                            "players_in_room"
+                        )
+                        .select("id", {
+                            count: "exact",
+                            head: true,
+                        })
+                        .eq(
+                            "room_id",
+                            roomId
+                        );
+
+                if (
+                    (remaining || 0) ===
+                    0
+                ) {
+                    await supaAdmin
+                        .from(
+                            "rooms"
+                        )
+                        .delete()
+                        .eq(
+                            "id",
+                            roomId
+                        );
+                } else {
+                    // Звільнилось місце — знову
+                    // відкриваємо кімнату для
+                    // matchmaking.
+                    await supaAdmin
+                        .from(
+                            "rooms"
+                        )
+                        .update({
+                            matchmaking_open:
+                                true,
+                        })
+                        .eq(
+                            "id",
+                            roomId
+                        );
+                }
+            }
 
             cleanupRoomConnectionState(
                 roomId
